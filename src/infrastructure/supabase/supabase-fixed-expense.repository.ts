@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Scope } from '@nestjs/common';
+import { REQUEST } from '@nestjs/core';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
   FixedExpenseInstanceRow,
@@ -6,13 +7,15 @@ import {
   FixedExpenseRepositoryPort,
   FixedExpenseRow,
 } from '../../domain/ports/fixed-expense-repository.port';
+import type { AuthenticatedRequest } from '../../auth/auth.types';
+import { getAuthenticatedUserId } from '../../auth/request-user.util';
 
-@Injectable()
+@Injectable({ scope: Scope.REQUEST })
 export class SupabaseFixedExpenseRepository implements FixedExpenseRepositoryPort {
   private readonly client: SupabaseClient;
   private readonly userId: string;
 
-  constructor() {
+  constructor(@Inject(REQUEST) request: AuthenticatedRequest) {
     const url = process.env.SUPABASE_URL?.trim();
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
     if (!url || !key) {
@@ -20,10 +23,7 @@ export class SupabaseFixedExpenseRepository implements FixedExpenseRepositoryPor
         'Definí SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en el entorno del servidor.',
       );
     }
-    this.userId = process.env.APP_USER_ID?.trim() ?? '';
-    if (!this.userId) {
-      throw new Error('Definí APP_USER_ID (uuid de auth.users) en el entorno del servidor.');
-    }
+    this.userId = getAuthenticatedUserId(request);
     this.client = createClient(url, key);
   }
 

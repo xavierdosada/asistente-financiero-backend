@@ -192,11 +192,18 @@ Colocá un archivo **`.env` en la carpeta `backend/`** (junto a `package.json`).
 | Variable | Uso |
 |----------|-----|
 | `SUPABASE_URL` | URL del proyecto Supabase. |
-| `SUPABASE_SERVICE_ROLE_KEY` | Clave de servicio (solo servidor) para insertar filas. |
-| `APP_USER_ID` | UUID existente en `auth.users` que usa el backend para escribir/leer `categories`, `cards` y `movements`. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Clave de servicio (solo servidor) para insertar/actualizar datos multiusuario. |
+| `SUPABASE_ANON_KEY` | Clave anónima usada por el guard JWT para validar el token de Supabase Auth. |
 | `G_GEMINI_API_KEY` | Clave de la [Google AI Studio](https://aistudio.google.com/apikey) (Gemini). |
 | `GEMINI_MODEL` | Opcional; por defecto `gemini-2.5-flash`. Si Google depreca el id, fijate los modelos listados en la consola / documentación y asigná uno acá. |
 | `PORT` | Opcional; puerto HTTP del servidor. |
+| `CORS_ORIGINS` | Opcional; lista separada por comas de orígenes permitidos (ej: `http://localhost:5173,https://tu-frontend.vercel.app`). En dev, por defecto permite `http://localhost:5173`. |
+
+## Autenticación
+
+- Todas las rutas de negocio requieren `Authorization: Bearer <access_token>` de Supabase Auth.
+- El backend toma `user_id` del JWT (claim `sub`) y filtra todos los accesos por ese usuario.
+- Sin token válido, responde `401 Unauthorized`.
 
 ## Cómo ejecutarlo
 

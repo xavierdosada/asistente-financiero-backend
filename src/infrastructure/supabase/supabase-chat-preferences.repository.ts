@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Scope } from '@nestjs/common';
+import { REQUEST } from '@nestjs/core';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
   ChatPreferences,
@@ -6,15 +7,17 @@ import {
   ChatPreferencesRepositoryPort,
 } from '../../domain/ports/chat-preferences.repository.port';
 import { EntryMode, isEntryMode } from '../../domain/ports/entry-mode.port';
+import type { AuthenticatedRequest } from '../../auth/auth.types';
+import { getAuthenticatedUserId } from '../../auth/request-user.util';
 
-@Injectable()
+@Injectable({ scope: Scope.REQUEST })
 export class SupabaseChatPreferencesRepository
   implements ChatPreferencesRepositoryPort
 {
   private readonly client: SupabaseClient;
   private readonly userId: string;
 
-  constructor() {
+  constructor(@Inject(REQUEST) request: AuthenticatedRequest) {
     const url = process.env.SUPABASE_URL?.trim();
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
     if (!url || !key) {
@@ -22,10 +25,7 @@ export class SupabaseChatPreferencesRepository
         'Definí SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en el entorno del servidor.',
       );
     }
-    this.userId = process.env.APP_USER_ID?.trim() ?? '';
-    if (!this.userId) {
-      throw new Error('Definí APP_USER_ID (uuid de auth.users) en el entorno del servidor.');
-    }
+    this.userId = getAuthenticatedUserId(request);
     this.client = createClient(url, key);
   }
 
