@@ -113,7 +113,12 @@ export class SupabaseBudgetRepository implements BudgetRepositoryPort {
     if (!budgets.length) return [];
     const spends = await this.loadSpentByCategory(monthStart, monthEnd);
     return budgets.map((b) => {
-      const spent = spends.get(`${b.category_id}|${b.currency}`) ?? 0;
+      const spentByCategory = spends.get(`${b.category_id}|${b.currency}`) ?? {
+        total: 0,
+        fixed: 0,
+        variable: 0,
+      };
+      const spent = spentByCategory.total;
       const remaining = b.amount - spent;
       const usedPercent = b.amount > 0 ? (spent / b.amount) * 100 : 0;
       return {
@@ -122,6 +127,8 @@ export class SupabaseBudgetRepository implements BudgetRepositoryPort {
         currency: b.currency,
         budget_amount: round2(b.amount),
         spent_amount: round2(spent),
+        fixed_spent_amount: round2(spentByCategory.fixed),
+        variable_spent_amount: round2(spentByCategory.variable),
         remaining_amount: round2(remaining),
         used_percent: round2(usedPercent),
       };
@@ -237,26 +244,41 @@ export class SupabaseBudgetRepository implements BudgetRepositoryPort {
   private async loadSpentByCategory(
     monthStart: string,
     monthEndExclusive: string,
-  ): Promise<Map<string, number>> {
+  ): Promise<Map<string, { total: number; fixed: number; variable: number }>> {
     const { data, error } = await this.client
       .from('movements')
-      .select('category_id, currency, amount')
+      .select('id, category_id, currency, amount, fixed_expense_instances(movement_id)')
       .eq('user_id', this.userId)
       .eq('status', 'active')
       .eq('direction', 'gasto')
       .gte('movement_date', monthStart)
       .lt('movement_date', monthEndExclusive);
     if (error) throw new Error(error.message);
-    const acc = new Map<string, number>();
+    const acc = new Map<string, { total: number; fixed: number; variable: number }>();
     for (const row of data ?? []) {
       const categoryId = row.category_id;
       if (!categoryId) continue;
       const currency = String(row.currency ?? 'ARS').toUpperCase();
       const key = `${String(categoryId)}|${currency}`;
-      acc.set(key, (acc.get(key) ?? 0) + Number(row.amount ?? 0));
+      const amount = Number(row.amount ?? 0);
+      const isFixed = movementIsFromFixedExpenseInstance(
+        (row as { fixed_expense_instances?: unknown }).fixed_expense_instances,
+      );
+      const prev = acc.get(key) ?? { total: 0, fixed: 0, variable: 0 };
+      acc.set(key, {
+        total: prev.total + amount,
+        fixed: prev.fixed + (isFixed ? amount : 0),
+        variable: prev.variable + (isFixed ? 0 : amount),
+      });
     }
     return acc;
   }
+}
+
+function movementIsFromFixedExpenseInstance(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') return true;
+  return false;
 }
 
 function todayIso(): string {

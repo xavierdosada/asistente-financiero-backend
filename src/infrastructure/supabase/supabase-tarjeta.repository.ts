@@ -107,6 +107,8 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       input.type_card !== undefined ? input.type_card : current.type_card;
     const closing_day =
       input.closing_day !== undefined ? input.closing_day : current.closing_day ?? null;
+    const closingDayChanged =
+      input.closing_day !== undefined && current.closing_day !== null && input.closing_day !== current.closing_day;
     const due_day = normalizeDueDay(input.due_day, current.due_day ?? 10);
 
     if (!bank) throw new Error('bank cannot be empty');
@@ -149,6 +151,9 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     ) {
       await this.applyDueDayToCurrentStatement(id, due_day);
     }
+    if (closingDayChanged && typeof closing_day === 'number') {
+      await this.reconcileStatementWindowsForClosingDayChange(id, closing_day);
+    }
     return data ? mapCardRow(data) : null;
   }
 
@@ -182,20 +187,35 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const creditLimit = card.credit_limit;
     // "Deuda próximo mes" debe incluir lo consumido en el ciclo vigente
     // (hasta el cierre inclusive), no el ciclo siguiente.
-    const [spentUntilCurrentClosing, paidUntilCurrentClosing, previousCycleDebt] = await Promise.all([
+    const [
+      spentUntilCurrentClosing,
+      spentUntilNextClosing,
+      paidUntilCurrentClosing,
+      previousCycleDebt,
+      previousCycleDebtProbe,
+    ] = await Promise.all([
       this.sumCardProjectedDebtByPeriod(id, cycleWindows.current.from, cycleWindows.current.to, scope),
+      this.sumCardProjectedDebtByPeriod(id, cycleWindows.next.from, cycleWindows.next.to, scope),
       this.sumCardPaymentsByPeriod(id, cycleWindows.current.from, cycleWindows.current.to, scope),
       !statementDebt.hasDueStatements && cycleWindows.previous ?
         this.sumCardProjectedDebtByPeriod(id, cycleWindows.previous.from, cycleWindows.previous.to, scope)
       : Promise.resolve(0),
+      cycleWindows.previous ?
+        this.sumCardProjectedDebtByPeriod(id, cycleWindows.previous.from, cycleWindows.previous.to, scope)
+      : Promise.resolve(0),
     ]);
     const carryOverBase =
-      statementDebt.hasDueStatements ? statementDebt.outstandingAmount : previousCycleDebt;
-    const carryOverDebt = round2(Math.max(carryOverBase - paidUntilCurrentClosing, 0));
-    const pendingMonthCredit = round2(Math.max(paidUntilCurrentClosing - carryOverBase, 0));
-    const nextMonthDebt = round2(
-      Math.max(carryOverDebt + spentUntilCurrentClosing - pendingMonthCredit, 0),
-    );
+      statementDebt.hasDueStatements ?
+        statementDebt.outstandingAmount
+      : previousCycleDebt;
+    const cycleOpen = isCycleOpenForReference(today, card.closing_day);
+    const debtBuckets = computeDebtBuckets({
+      carryOverBase,
+      paidUntilCurrentClosing,
+      spentUntilCurrentClosing,
+      spentUntilNextClosing,
+      cycleOpen,
+    });
 
     return {
       card_id: card.id,
@@ -203,9 +223,9 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       month_next: next.label,
       spent_current: spentCurrent,
       spent_next: spentNext,
-      pending_month_debt: carryOverDebt,
-      pending_month_credit: pendingMonthCredit,
-      next_month_debt: nextMonthDebt,
+      pending_month_debt: debtBuckets.pendingMonthDebt,
+      pending_month_credit: debtBuckets.pendingMonthCredit,
+      next_month_debt: debtBuckets.nextMonthDebt,
       credit_limit: creditLimit,
       available_current: creditLimit === null ? null : round2(creditLimit - spentCurrent),
       available_next: creditLimit === null ? null : round2(creditLimit - spentNext),
@@ -501,6 +521,9 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       const paidAmount = Number(row.paid_amount);
       const remaining = round2(Math.max(amount - paidAmount, 0));
       if (remaining <= 0) continue;
+      const projectedDueDate = projectPendingInstallmentToNextCardDueDate(
+        card.due_day,
+      );
 
       installments.push({
         debt_id: row.debt_id,
@@ -508,13 +531,19 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
         debt_total_installments: Number(debtRef.total_installments),
         installment_id: row.id,
         installment_number: Number(row.installment_number),
-        due_date: row.due_date,
+        due_date: projectedDueDate,
         amount,
         paid_amount: paidAmount,
         remaining_amount: remaining,
         status: normalizeCardInstallmentStatus(row.status),
       });
     }
+
+    installments.sort((a, b) => {
+      if (a.due_date < b.due_date) return -1;
+      if (a.due_date > b.due_date) return 1;
+      return a.installment_number - b.installment_number;
+    });
 
     const total_remaining_amount = round2(
       installments.reduce((s, r) => s + r.remaining_amount, 0),
@@ -914,8 +943,20 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       typeof card.closing_day === 'number' ?
         cycleWindowsByClosingDay(today, card.closing_day)
       : null;
-    const currentWindow = currentStmt ?? cycleByClosingDay?.current ?? { from: current.from, to: current.to };
-    const nextWindow = nextStmt ?? {
+    const useCurrentStmt =
+      currentStmt !== null &&
+      (cycleByClosingDay === null || sameWindow(currentStmt, cycleByClosingDay.current));
+    const useNextStmt =
+      nextStmt !== null &&
+      (cycleByClosingDay === null || sameWindow(nextStmt, cycleByClosingDay.next));
+    const currentWindow =
+      useCurrentStmt ?
+        currentStmt
+      : cycleByClosingDay?.current ?? { from: current.from, to: current.to };
+    const nextWindow =
+      useNextStmt ?
+        nextStmt
+      : {
       from: addDaysIso(currentWindow.to, 1),
       to: cycleByClosingDay?.next.to ?? next.to,
     };
@@ -1019,6 +1060,44 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       .eq('id', statement.id)
       .eq('user_id', this.userId);
     if (updateError) throw new Error(updateError.message);
+  }
+
+  private async reconcileStatementWindowsForClosingDayChange(
+    cardId: string,
+    closingDay: number,
+    today: Date = new Date(),
+  ): Promise<void> {
+    const windows = cycleWindowsByClosingDay(today, closingDay);
+    const targets: Array<{ period: string; from: string; to: string }> = [
+      { period: monthRange(today, -1).label, from: windows.previous.from, to: windows.previous.to },
+      { period: monthRange(today, 0).label, from: windows.current.from, to: windows.current.to },
+      { period: monthRange(today, 1).label, from: windows.next.from, to: windows.next.to },
+    ];
+
+    for (const target of targets) {
+      const ym = parseYearMonth(target.period);
+      if (!ym) continue;
+      const { data: statement, error: fetchError } = await this.client
+        .from('card_statements')
+        .select('id, status, opened_at, closed_at')
+        .eq('user_id', this.userId)
+        .eq('card_id', cardId)
+        .eq('period_year', ym.year)
+        .eq('period_month', ym.month)
+        .maybeSingle();
+      if (fetchError) throw new Error(fetchError.message);
+      if (!statement || statement.status === 'pagado') continue;
+
+      const { error: updateError } = await this.client
+        .from('card_statements')
+        .update({
+          opened_at: target.from,
+          closed_at: target.to,
+        })
+        .eq('id', statement.id)
+        .eq('user_id', this.userId);
+      if (updateError) throw new Error(updateError.message);
+    }
   }
 }
 
@@ -1236,6 +1315,13 @@ function parseYearMonth(value: string): { year: number; month: number } | null {
   return { year, month };
 }
 
+function sameWindow(
+  a: { from: string; to: string },
+  b: { from: string; to: string },
+): boolean {
+  return a.from === b.from && a.to === b.to;
+}
+
 function cycleWindowsByClosingDay(
   reference: Date,
   closingDay: number,
@@ -1283,6 +1369,54 @@ function cycleWindowsByClosingDay(
   };
 }
 
+type DebtBucketsInput = {
+  carryOverBase: number;
+  paidUntilCurrentClosing: number;
+  spentUntilCurrentClosing: number;
+  spentUntilNextClosing: number;
+  cycleOpen: boolean;
+};
+
+export function computeDebtBuckets(input: DebtBucketsInput): {
+  pendingMonthDebt: number;
+  pendingMonthCredit: number;
+  nextMonthDebt: number;
+} {
+  const carryOverDebt = round2(Math.max(input.carryOverBase - input.paidUntilCurrentClosing, 0));
+  const pendingMonthCredit = round2(Math.max(input.paidUntilCurrentClosing - input.carryOverBase, 0));
+
+  // When the cycle is still open, "A pagar" should already include
+  // charges accumulated up to the current closing date.
+  if (input.cycleOpen) {
+    const result = {
+      pendingMonthDebt: carryOverDebt,
+      pendingMonthCredit,
+      nextMonthDebt: round2(Math.max(input.spentUntilNextClosing, 0)),
+    };
+    return result;
+  }
+
+  const result = {
+    pendingMonthDebt: carryOverDebt,
+    pendingMonthCredit,
+    nextMonthDebt: round2(
+      Math.max(carryOverDebt + input.spentUntilCurrentClosing - pendingMonthCredit, 0),
+    ),
+  };
+  return result;
+}
+
+function isCycleOpenForReference(reference: Date, closingDay: number | null | undefined): boolean {
+  if (!Number.isInteger(closingDay)) return false;
+  const normalizedClosing = Number(closingDay);
+  if (normalizedClosing < 1) return false;
+  const year = reference.getUTCFullYear();
+  const month = reference.getUTCMonth();
+  const monthLastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const effectiveClosing = Math.min(normalizedClosing, monthLastDay);
+  return reference.getUTCDate() <= effectiveClosing;
+}
+
 function dateWithClampedDayUTC(year: number, monthIndex: number, day: number): Date {
   const first = new Date(Date.UTC(year, monthIndex, 1));
   const lastDay = new Date(
@@ -1303,4 +1437,30 @@ function isIsoDate(s: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const t = Date.parse(`${s}T12:00:00.000Z`);
   return !Number.isNaN(t);
+}
+
+function projectPendingInstallmentToNextCardDueDate(
+  dueDay: number | null | undefined,
+  reference: Date = new Date(),
+): string {
+  const dueDaySafe =
+    Number.isInteger(dueDay) && Number(dueDay) >= 1 && Number(dueDay) <= 31 ? Number(dueDay) : 10;
+  const year = reference.getUTCFullYear();
+  const month = reference.getUTCMonth();
+  const thisMonthDue = dateWithClampedDayUTC(year, month, dueDaySafe);
+  const referenceDayStart = Date.UTC(
+    reference.getUTCFullYear(),
+    reference.getUTCMonth(),
+    reference.getUTCDate(),
+  );
+  const thisMonthDueStart = Date.UTC(
+    thisMonthDue.getUTCFullYear(),
+    thisMonthDue.getUTCMonth(),
+    thisMonthDue.getUTCDate(),
+  );
+  const effectiveDue =
+    referenceDayStart <= thisMonthDueStart ?
+      thisMonthDue
+    : dateWithClampedDayUTC(year, month + 1, dueDaySafe);
+  return toIsoDate(effectiveDue);
 }

@@ -31,37 +31,69 @@ describe('Movimientos endpoints', () => {
   });
 
   it('GET /movements returns list', async () => {
-    repo.listRecent.mockResolvedValueOnce([
-      {
-        id: 'mov-1',
-        direction: 'gasto',
-        amount: 1000,
-        currency: 'ARS',
-        detail: 'almuerzo',
-        payment_method: 'efectivo',
-        movement_date: '2026-04-10',
-        entry_mode: 'operativo',
-        category_id: 'cat-1',
-        card_id: null,
-        loan_id: null,
-        settled_card_id: null,
-        installments_total: null,
-        installment_number: null,
-        created_at: '2026-04-10T12:00:00Z',
-        fx_ars_per_usd: null,
-      },
-    ]);
+    repo.listRecent.mockResolvedValueOnce({
+      items: [
+        {
+          id: 'mov-1',
+          direction: 'gasto',
+          amount: 1000,
+          currency: 'ARS',
+          detail: 'almuerzo',
+          payment_method: 'efectivo',
+          movement_date: '2026-04-10',
+          entry_mode: 'operativo',
+          category_id: 'cat-1',
+          card_id: null,
+          loan_id: null,
+          settled_card_id: null,
+          installments_total: null,
+          installment_number: null,
+          created_at: '2026-04-10T12:00:00Z',
+          fx_ars_per_usd: null,
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    });
 
     const res = await request(app.getHttpServer()).get('/movements?limit=10');
 
     expect(res.status).toBe(200);
-    expect(res.body).toHaveLength(1);
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.has_more).toBe(false);
   });
 
   it('GET /movements returns 400 for invalid entry_mode', async () => {
     const res = await request(app.getHttpServer()).get('/movements?entry_mode=foo');
 
     expect(res.status).toBe(400);
+  });
+
+  it('GET /movements returns 400 when cursor params are incomplete', async () => {
+    const res = await request(app.getHttpServer()).get(
+      '/movements?cursor_created_at=2026-04-10T12:00:00.000Z',
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('GET /movements forwards cursor params', async () => {
+    repo.listRecent.mockResolvedValueOnce({
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    const res = await request(app.getHttpServer()).get(
+      '/movements?limit=10&cursor_created_at=2026-04-10T12:00:00.000Z&cursor_id=mov-1',
+    );
+    expect(res.status).toBe(200);
+    expect(repo.listRecent).toHaveBeenCalledWith({
+      limit: 10,
+      entryMode: undefined,
+      from: undefined,
+      to: undefined,
+      cursorCreatedAt: '2026-04-10T12:00:00.000Z',
+      cursorId: 'mov-1',
+    });
   });
 
   it('DELETE /movements/:id deletes movement', async () => {

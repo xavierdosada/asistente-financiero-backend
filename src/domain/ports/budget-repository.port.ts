@@ -15,6 +15,8 @@ export type BudgetProgressRow = {
   currency: string;
   budget_amount: number;
   spent_amount: number;
+  fixed_spent_amount: number;
+  variable_spent_amount: number;
   remaining_amount: number;
   used_percent: number;
 };

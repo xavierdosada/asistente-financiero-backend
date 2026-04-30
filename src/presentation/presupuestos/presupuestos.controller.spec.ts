@@ -48,6 +48,29 @@ describe('Presupuestos endpoints', () => {
     expect(repo.getProgress).toHaveBeenCalled();
   });
 
+  it('GET /budgets/progress includes fixed and variable breakdown', async () => {
+    repo.getProgress.mockResolvedValueOnce([
+      {
+        category_id: 'cat-1',
+        category_name: 'Comida',
+        currency: 'ARS',
+        budget_amount: 500000,
+        spent_amount: 250000,
+        fixed_spent_amount: 200000,
+        variable_spent_amount: 50000,
+        remaining_amount: 250000,
+        used_percent: 50,
+      },
+    ]);
+    const res = await request(app.getHttpServer()).get('/budgets/progress');
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({
+      fixed_spent_amount: 200000,
+      variable_spent_amount: 50000,
+      spent_amount: 250000,
+    });
+  });
+
   it('GET /budgets/real-spend uses default range when no query', async () => {
     repo.getRealSpendAnalytics.mockResolvedValueOnce({
       from: '2025-11-01',

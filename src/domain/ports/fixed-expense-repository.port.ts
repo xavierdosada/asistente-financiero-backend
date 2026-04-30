@@ -9,6 +9,8 @@ export type FixedExpenseRow = {
   payment_method: 'efectivo' | 'tarjeta';
   card_id: string | null;
   due_day: number;
+  start_month: string | null;
+  accrual_day: number | null;
   is_active: boolean;
   created_at?: string;
   updated_at?: string;
@@ -48,6 +50,8 @@ export interface FixedExpenseRepositoryPort {
     payment_method: 'efectivo' | 'tarjeta';
     card_id: string | null;
     due_day: number;
+    start_month: string | null;
+    accrual_day: number | null;
   }): Promise<FixedExpenseRow>;
   update(
     id: string,
@@ -60,6 +64,8 @@ export interface FixedExpenseRepositoryPort {
       payment_method: 'efectivo' | 'tarjeta';
       card_id: string | null;
       due_day: number;
+      start_month: string | null;
+      accrual_day: number | null;
       is_active: boolean;
     }>,
   ): Promise<FixedExpenseRow | null>;

@@ -10,6 +10,8 @@ export type ListMovementsInput = {
   entryMode?: EntryMode;
   from?: string;
   to?: string;
+  cursorCreatedAt?: string;
+  cursorId?: string;
 };
 
 export type MovementListItem = {
@@ -29,6 +31,17 @@ export type MovementListItem = {
   installment_number: number | null;
   created_at: string;
   fx_ars_per_usd: number | null;
+};
+
+export type MovementsCursor = {
+  created_at: string;
+  id: string;
+};
+
+export type MovementListPage = {
+  items: MovementListItem[];
+  next_cursor: MovementsCursor | null;
+  has_more: boolean;
 };
 
 export type DeleteMovementSummary = {
@@ -68,7 +81,7 @@ export class SupabaseMovementQueryRepository {
     this.client = createClient(url, key);
   }
 
-  async listRecent(input: ListMovementsInput): Promise<MovementListItem[]> {
+  async listRecent(input: ListMovementsInput): Promise<MovementListPage> {
     let query = this.client
       .from('movements')
       .select(
@@ -77,7 +90,8 @@ export class SupabaseMovementQueryRepository {
       .eq('user_id', this.userId)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
-      .limit(input.limit);
+      .order('id', { ascending: false })
+      .limit(input.limit + 1);
 
     if (input.entryMode) {
       query = query.eq('entry_mode', input.entryMode);
@@ -88,11 +102,16 @@ export class SupabaseMovementQueryRepository {
     if (input.to) {
       query = query.lte('movement_date', input.to);
     }
+    if (input.cursorCreatedAt && input.cursorId) {
+      query = query.or(
+        `created_at.lt.${input.cursorCreatedAt},and(created_at.eq.${input.cursorCreatedAt},id.lt.${input.cursorId})`,
+      );
+    }
 
     const { data, error } = await query;
     if (error) throw new Error(error.message);
 
-    return (data ?? []).map((row: {
+    const mapped = (data ?? []).map((row: {
       id: string;
       direction: string;
       amount: number | string;
@@ -121,6 +140,17 @@ export class SupabaseMovementQueryRepository {
           null
         : Number(row.fx_ars_per_usd),
     }));
+    const hasMore = mapped.length > input.limit;
+    const items = hasMore ? mapped.slice(0, input.limit) : mapped;
+    const last = items[items.length - 1];
+    return {
+      items,
+      next_cursor:
+        hasMore && last ?
+          { created_at: last.created_at, id: last.id }
+        : null,
+      has_more: hasMore,
+    };
   }
 
   async deleteById(

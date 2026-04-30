@@ -77,6 +77,8 @@ export class MovimientosController {
     @Query('entry_mode') entryMode?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('cursor_created_at') cursorCreatedAt?: string,
+    @Query('cursor_id') cursorId?: string,
   ) {
     const resolvedLimit = limit ? Number(limit) : 100;
     if (!Number.isInteger(resolvedLimit) || resolvedLimit <= 0 || resolvedLimit > 500) {
@@ -97,6 +99,17 @@ export class MovimientosController {
     if (from && to && from > to) {
       throw new HttpException('from no puede ser mayor que to', HttpStatus.BAD_REQUEST);
     }
+    const hasCursorCreatedAt = typeof cursorCreatedAt === 'string' && cursorCreatedAt.trim().length > 0;
+    const hasCursorId = typeof cursorId === 'string' && cursorId.trim().length > 0;
+    if (hasCursorCreatedAt !== hasCursorId) {
+      throw new HttpException(
+        'cursor_created_at y cursor_id deben enviarse juntos',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    if (hasCursorCreatedAt && !isIsoDateTime(cursorCreatedAt!)) {
+      throw new HttpException('cursor_created_at inválido (ISO datetime)', HttpStatus.BAD_REQUEST);
+    }
 
     try {
       return await this.movements.listRecent({
@@ -104,6 +117,8 @@ export class MovimientosController {
         entryMode,
         from,
         to,
+        cursorCreatedAt: hasCursorCreatedAt ? cursorCreatedAt!.trim() : undefined,
+        cursorId: hasCursorId ? cursorId!.trim() : undefined,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Error interno';
@@ -147,4 +162,8 @@ export class MovimientosController {
 function isIsoYmd(v: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
   return !Number.isNaN(Date.parse(`${v}T12:00:00.000Z`));
+}
+
+function isIsoDateTime(v: string): boolean {
+  return !Number.isNaN(Date.parse(v));
 }

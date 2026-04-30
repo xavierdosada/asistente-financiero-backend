@@ -27,6 +27,8 @@ create table if not exists public.fixed_expenses (
   payment_method text not null check (payment_method in ('efectivo', 'tarjeta')),
   card_id uuid references public.cards(id) on delete set null,
   due_day smallint not null check (due_day between 1 and 31),
+  start_month date not null default date_trunc('month', now())::date,
+  accrual_day smallint check (accrual_day is null or accrual_day between 1 and 31),
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
