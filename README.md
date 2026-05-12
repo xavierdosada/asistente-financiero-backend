@@ -86,7 +86,7 @@ Entrada HTTP y composición del módulo de esa funcionalidad.
 | `GET` | `/tarjetas/:id/resumenes/:statementId` | detalle del resumen con líneas imputadas |
 | `GET` | `/tarjetas/:id/gastos?from=YYYY-MM-DD&to=YYYY-MM-DD&scope=operativo\|historico\|ambos` | gasto acumulado de tarjeta en rango + desglose mensual (default `operativo`) |
 | `POST` | `/tarjetas/:id/resumenes/generar` | genera/cierra resumen mensual calendario (`year`, `month`) |
-| `POST` | `/tarjetas/:id/deuda-inicial` | bootstrap de deuda actual de tarjeta para un mes (`year`, `month`, `outstanding_amount`, `due_date?`) |
+| `POST` | `/tarjetas/:id/deuda-inicial` | bootstrap de deuda actual de tarjeta para un mes (`year`, `month`, `outstanding_amount`, `due_date?`). `outstanding_amount`: número JSON (`892754.96`) o **string** en formato es-AR (`"892754,96"` / `"892.754,96"`). Ese monto se guarda en `opening_carry_amount` y **se suma al total** al generar el resumen del mismo mes. |
 | `POST` | `/asesor/messages` | chat del Asesor Financiero IA orientado a análisis con datos reales (opcional `scope=operativo\|historico\|ambos`, default `ambos`) |
 | `PUT` | `/chat/preferences` | patch parcial de preferencias (`auto_create_category_default?`, `default_entry_mode?`) |
 | `POST` | `/categorias`, `/tarjetas` | fila creada |
@@ -133,6 +133,7 @@ Para el flujo de caja mensual con modelo `movements/accounts`, corré también:
 - `database/update_chat_preferences_default_entry_mode.sql`
 - `database/update_apply_movement_trigger_for_entry_mode.sql`
 - `database/fix_loan_installments_progress_consistency.sql` (si ves desfasajes de cuota actual al registrar pagos de préstamo)
+- `database/add_card_statements_opening_carry.sql` (deuda inicial que no se pierde al `POST .../resumenes/generar`)
 
 Orden recomendado de migraciones nuevas:
 1. `add_movements_entry_mode.sql`

@@ -2,6 +2,9 @@ import type { EntryMode } from '../ports/entry-mode.port';
 export type MovimientoTipo = 'ingreso' | 'gasto';
 export type MedioPago = 'efectivo' | 'tarjeta';
 
+/** Dónde impacta una cuota no inicial (N>1) en el calendario de resúmenes. */
+export type InstallmentStatementImpact = 'closed_statement' | 'next_statement';
+
 /**
  * Registro de ingreso o egreso derivado del mensaje del usuario.
  * Tabla: public.ingresos_egresos
@@ -34,5 +37,7 @@ export class IngresoEgreso {
     public readonly rawMessage: string,
     /** ARS por 1 USD al registrar; obligatorio para gasto+tarjeta+USD. */
     public readonly fxArsPerUsd: number | null = null,
+    /** Solo cuotas no iniciales: ancla `first_due_date` de la deuda al resumen elegido. */
+    public readonly installmentStatementImpact: InstallmentStatementImpact | null = null,
   ) {}
 }

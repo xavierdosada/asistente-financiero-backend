@@ -21,7 +21,9 @@ describe('Tarjetas endpoints', () => {
     listStatementsByCardId: jest.fn(),
     getStatementById: jest.fn(),
     generateMonthlyStatement: jest.fn(),
+    updateStatementWindow: jest.fn(),
     spendByRange: jest.fn(),
+    payableStatementByCardId: jest.fn(),
     pendingInstallmentsByCardId: jest.fn(),
     setInitialDebt: jest.fn(),
     totalDebtAllCreditCards: jest.fn(),
@@ -213,13 +215,20 @@ describe('Tarjetas endpoints', () => {
       month_current: '2026-04',
       month_next: '2026-05',
       spent_current: 9000,
+      spent_current_usd: 10,
       spent_next: 0,
+      spent_next_usd: 0,
       pending_month_debt: 3000,
+      pending_month_debt_usd: 25,
       pending_month_credit: 0,
+      pending_month_credit_usd: 0,
       next_month_debt: 8000,
+      next_month_debt_usd: 5,
       credit_limit: 100000,
       available_current: 91000,
       available_next: 100000,
+      current_cycle: { from: '2026-03-28', to: '2026-04-27' },
+      next_cycle: { from: '2026-04-28', to: '2026-05-27' },
     });
 
     const res = await request(app.getHttpServer()).get('/tarjetas/1/resumen');
@@ -227,8 +236,11 @@ describe('Tarjetas endpoints', () => {
     expect(res.status).toBe(200);
     expect(res.body.available_current).toBe(91000);
     expect(res.body.pending_month_debt).toBe(3000);
+    expect(res.body.pending_month_debt_usd).toBe(25);
     expect(res.body.pending_month_credit).toBe(0);
     expect(res.body.next_month_debt).toBe(8000);
+    expect(res.body.next_month_debt_usd).toBe(5);
+    expect(res.body.spent_current_usd).toBe(10);
   });
 
   it('GET /tarjetas/:id/deudas returns card debts with installments', async () => {
@@ -306,8 +318,13 @@ describe('Tarjetas endpoints', () => {
         closed_at: '2026-04-30',
         due_date: '2026-05-10',
         total_amount: 120000,
+        total_amount_usd: 0,
         paid_amount: 60000,
+        paid_amount_usd: 0,
         outstanding_amount: 60000,
+        outstanding_amount_usd: 0,
+        opening_carry_amount: 0,
+        opening_carry_amount_usd: 0,
         status: 'cerrado',
       },
     ]);
@@ -328,8 +345,13 @@ describe('Tarjetas endpoints', () => {
       closed_at: '2026-04-30',
       due_date: '2026-05-10',
       total_amount: 120000,
+      total_amount_usd: 0,
       paid_amount: 60000,
+      paid_amount_usd: 0,
       outstanding_amount: 60000,
+      outstanding_amount_usd: 0,
+      opening_carry_amount: 0,
+      opening_carry_amount_usd: 0,
       status: 'cerrado',
       lines: [
         {
@@ -339,6 +361,8 @@ describe('Tarjetas endpoints', () => {
           installment_id: null,
           detail: 'Supermercado',
           amount: 60000,
+          currency: 'ARS',
+          fx_ars_per_usd: null,
         },
       ],
     });
@@ -359,8 +383,13 @@ describe('Tarjetas endpoints', () => {
       closed_at: '2026-04-30',
       due_date: '2026-05-10',
       total_amount: 120000,
+      total_amount_usd: 0,
       paid_amount: 0,
+      paid_amount_usd: 0,
       outstanding_amount: 120000,
+      outstanding_amount_usd: 0,
+      opening_carry_amount: 0,
+      opening_carry_amount_usd: 0,
       status: 'cerrado',
       lines: [],
     });
@@ -383,8 +412,13 @@ describe('Tarjetas endpoints', () => {
       closed_at: '2026-04-30',
       due_date: '2026-05-10',
       total_amount: 300000,
+      total_amount_usd: 0,
       paid_amount: 0,
+      paid_amount_usd: 0,
       outstanding_amount: 300000,
+      outstanding_amount_usd: 0,
+      opening_carry_amount: 300000,
+      opening_carry_amount_usd: 0,
       status: 'cerrado',
     });
 
@@ -394,6 +428,37 @@ describe('Tarjetas endpoints', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.outstanding_amount).toBe(300000);
+  });
+
+  it('POST /tarjetas/:id/deuda-inicial parses es-AR string amount', async () => {
+    repo.setInitialDebt.mockResolvedValueOnce({
+      id: 'st-boot-2',
+      card_id: '1',
+      period_year: 2026,
+      period_month: 4,
+      opened_at: '2026-04-01',
+      closed_at: '2026-04-30',
+      due_date: '2026-05-06',
+      total_amount: 892754.96,
+      total_amount_usd: 0,
+      paid_amount: 0,
+      paid_amount_usd: 0,
+      outstanding_amount: 892754.96,
+      outstanding_amount_usd: 0,
+      opening_carry_amount: 892754.96,
+      opening_carry_amount_usd: 0,
+      status: 'cerrado',
+    });
+
+    const res = await request(app.getHttpServer())
+      .post('/tarjetas/1/deuda-inicial')
+      .send({ year: 2026, month: 4, outstanding_amount: '892.754,96', due_date: '2026-05-06' });
+
+    expect(res.status).toBe(201);
+    expect(repo.setInitialDebt).toHaveBeenCalledWith(
+      '1',
+      expect.objectContaining({ outstanding_amount: 892754.96 }),
+    );
   });
 
   it('GET /tarjetas/:id/gastos returns range summary', async () => {

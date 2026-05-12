@@ -124,6 +124,7 @@ describe('Movimientos endpoints', () => {
       id: 'mov-1',
       category_id: 'cat-2',
       detail: 'almuerzo',
+      amount: 1000,
     });
 
     const res = await request(app.getHttpServer())
@@ -135,6 +136,7 @@ describe('Movimientos endpoints', () => {
       id: 'mov-1',
       category_id: 'cat-2',
       detail: 'almuerzo',
+      amount: 1000,
     });
   });
 
@@ -168,6 +170,7 @@ describe('Movimientos endpoints', () => {
       id: 'mov-1',
       category_id: 'cat-1',
       detail: 'Cena con amigos',
+      amount: 1000,
     });
 
     const res = await request(app.getHttpServer())
@@ -176,5 +179,34 @@ describe('Movimientos endpoints', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.detail).toBe('Cena con amigos');
+  });
+
+  it('PATCH /movements/:id updates amount', async () => {
+    repo.updateById.mockResolvedValueOnce({
+      id: 'mov-1',
+      category_id: 'cat-1',
+      detail: 'almuerzo',
+      amount: 16400,
+    });
+
+    const res = await request(app.getHttpServer())
+      .patch('/movements/mov-1')
+      .send({ amount: 16400 });
+
+    expect(res.status).toBe(200);
+    expect(repo.updateById).toHaveBeenCalledWith('mov-1', {
+      category_id: undefined,
+      detail: undefined,
+      amount: 16400,
+    });
+    expect(res.body.amount).toBe(16400);
+  });
+
+  it('PATCH /movements/:id returns 400 for invalid amount', async () => {
+    const res = await request(app.getHttpServer())
+      .patch('/movements/mov-1')
+      .send({ amount: 0 });
+
+    expect(res.status).toBe(400);
   });
 });

@@ -3,7 +3,9 @@ import { REQUEST } from '@nestjs/core';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
   CreateLoanInput,
+  LoanCurrentMonthInstallmentUpdateRow,
   LoanInstallmentRow,
+  LoanPaymentRow,
   LoanRepositoryPort,
   LoanRow,
   UpdateLoanInput,
@@ -65,7 +67,7 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
       .order('installment_number', { ascending: true });
     if (error) throw new Error(error.message);
 
-    return (data ?? []).map((row: {
+    const mapped = (data ?? []).map((row: {
       id: string;
       loan_id: string;
       installment_number: number;
@@ -84,6 +86,173 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
       status: normalizeInstallmentStatus(row.status),
       paid_at: row.paid_at,
     }));
+    return mapped;
+  }
+
+  async listPayments(loanId?: string): Promise<LoanPaymentRow[]> {
+    let query = this.client
+      .from('loan_payment_events')
+      .select(
+        'id, loan_id, movement_id, amount, payment_date, created_at, loans!inner(name), movements!inner(id, detail, currency, movement_date)',
+      )
+      .eq('user_id', this.userId)
+      .order('payment_date', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (loanId) {
+      query = query.eq('loan_id', loanId);
+    }
+
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+
+    return (data ?? []).map(mapLoanPaymentRow);
+  }
+
+  async updateCurrentMonthInstallment(
+    loanId: string,
+    amount: number,
+  ): Promise<LoanCurrentMonthInstallmentUpdateRow | null> {
+    const loan = await this.findById(loanId);
+    if (!loan) return null;
+    validatePositive(amount, 'amount');
+
+    const { monthStart, monthEnd, today } = currentMonthRange();
+    const { data: installment, error: installmentError } = await this.client
+      .from('loan_installments')
+      .select('id, loan_id, installment_number, due_date, amount, paid_amount, status, paid_at')
+      .eq('loan_id', loanId)
+      .gte('due_date', monthStart)
+      .lte('due_date', monthEnd)
+      .order('due_date', { ascending: true })
+      .order('installment_number', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (installmentError) throw new Error(installmentError.message);
+    if (!installment) {
+      throw new Error('current_month_installment_not_found');
+    }
+
+    const paidAmount = Number(installment.paid_amount ?? 0);
+    if (amount < paidAmount) {
+      throw new Error('amount_below_paid_amount');
+    }
+
+    const nextStatus = resolveInstallmentStatus({
+      dueDate: String(installment.due_date),
+      paidAmount,
+      amount,
+      today,
+    });
+    const { error: updateError } = await this.client
+      .from('loan_installments')
+      .update({
+        amount: round2(amount),
+        status: nextStatus,
+        paid_at: nextStatus === 'pagada' ? installment.paid_at : null,
+      })
+      .eq('id', String(installment.id))
+      .eq('loan_id', loanId);
+    if (updateError) throw new Error(updateError.message);
+
+    await this.recalcLoan(loanId);
+
+    const refreshedLoan = await this.findById(loanId);
+    const { data: refreshedInstallment, error: refreshedInstallmentError } = await this.client
+      .from('loan_installments')
+      .select('id, loan_id, installment_number, due_date, amount, paid_amount, status, paid_at')
+      .eq('id', String(installment.id))
+      .maybeSingle();
+    if (refreshedInstallmentError) throw new Error(refreshedInstallmentError.message);
+    if (!refreshedLoan || !refreshedInstallment) {
+      throw new Error('post_update_not_found');
+    }
+
+    return {
+      loan: refreshedLoan,
+      installment: mapLoanInstallmentRow(refreshedInstallment),
+    };
+  }
+
+  async adjustPayment(
+    loanId: string,
+    paymentId: string,
+    patch: { amount: number; payment_date?: string },
+  ): Promise<LoanPaymentRow | null> {
+    validatePositive(patch.amount, 'amount');
+    if (patch.payment_date !== undefined) {
+      validateIsoDate(patch.payment_date, 'payment_date');
+    }
+
+    const { data: payment, error: paymentError } = await this.client
+      .from('loan_payment_events')
+      .select(
+        'id, loan_id, movement_id, amount, payment_date, created_at, movements!inner(id, direction, currency, detail, category_id, payment_method, account_id, card_id, installments_total, installment_number, loan_id, settled_card_id, entry_mode, raw_message, fx_ars_per_usd, movement_date)',
+      )
+      .eq('id', paymentId)
+      .eq('loan_id', loanId)
+      .eq('user_id', this.userId)
+      .maybeSingle();
+    if (paymentError) throw new Error(paymentError.message);
+    if (!payment) return null;
+
+    const movementRaw = payment.movements as
+      | Record<string, unknown>
+      | Record<string, unknown>[]
+      | null;
+    const movement = Array.isArray(movementRaw) ? movementRaw[0] : movementRaw;
+    if (!movement) throw new Error('payment_movement_not_found');
+    const nextAmount = round2(patch.amount);
+    const nextPaymentDate = patch.payment_date ?? String(payment.payment_date);
+
+    if (
+      nextAmount === round2(Number(payment.amount)) &&
+      nextPaymentDate === String(payment.payment_date)
+    ) {
+      const rows = await this.listPayments(loanId);
+      return rows.find((row) => row.id === paymentId) ?? null;
+    }
+
+    await this.reverseMovement(String(payment.movement_id), 'Ajuste de pago de préstamo');
+
+    const { data: insertedMovement, error: insertMovementError } = await this.client
+      .from('movements')
+      .insert({
+        user_id: this.userId,
+        direction: movement.direction,
+        currency: movement.currency,
+        amount: nextAmount,
+        detail: movement.detail,
+        category_id: movement.category_id,
+        payment_method: movement.payment_method,
+        account_id: movement.account_id,
+        card_id: movement.card_id,
+        installments_total: movement.installments_total,
+        installment_number: movement.installment_number,
+        loan_id: movement.loan_id,
+        settled_card_id: movement.settled_card_id,
+        entry_mode: movement.entry_mode,
+        movement_date: nextPaymentDate,
+        raw_message: movement.raw_message,
+        fx_ars_per_usd: movement.fx_ars_per_usd,
+      })
+      .select('id')
+      .single();
+    if (insertMovementError) throw new Error(insertMovementError.message);
+    if (!insertedMovement?.id) throw new Error('new_movement_not_created');
+
+    const { data: adjusted, error: adjustedError } = await this.client
+      .from('loan_payment_events')
+      .select(
+        'id, loan_id, movement_id, amount, payment_date, created_at, loans!inner(name), movements!inner(id, detail, currency, movement_date)',
+      )
+      .eq('movement_id', String(insertedMovement.id))
+      .eq('loan_id', loanId)
+      .eq('user_id', this.userId)
+      .maybeSingle();
+    if (adjustedError) throw new Error(adjustedError.message);
+    if (!adjusted) throw new Error('loan_payment_event_not_created');
+
+    return mapLoanPaymentRow(adjusted);
   }
 
   async create(input: CreateLoanInput): Promise<LoanRow> {
@@ -96,10 +265,11 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
     if (installmentsPaid > input.total_installments) {
       throw new Error('installments_paid no puede ser mayor a total_installments');
     }
-    const outstanding =
-      input.outstanding_amount === undefined
-        ? input.installment_amount * (input.total_installments - installmentsPaid)
-        : input.outstanding_amount;
+    const outstanding = calculateDerivedOutstanding({
+      installmentAmount: input.installment_amount,
+      totalInstallments: input.total_installments,
+      installmentsPaid,
+    });
     validateNonNegative(outstanding, 'outstanding_amount');
 
     const currency = normalizeLoanCurrency(input.currency);
@@ -131,7 +301,15 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
   }
 
   async update(id: string, input: UpdateLoanInput): Promise<LoanRow | null> {
+    const current = await this.findById(id);
+    if (!current) return null;
+
     const patch: Record<string, unknown> = {};
+    let nextInstallmentAmount = current.installment_amount;
+    let nextTotalInstallments = current.total_installments;
+    let nextInstallmentsPaid = current.installments_paid;
+    let recalculatesOutstanding = false;
+
     if (input.name !== undefined) {
       if (!input.name.trim()) throw new Error('name no puede ser vacío');
       patch.name = input.name.trim();
@@ -148,19 +326,24 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
     }
     if (input.installment_amount !== undefined) {
       validatePositive(input.installment_amount, 'installment_amount');
-      patch.installment_amount = round2(input.installment_amount);
-    }
-    if (input.outstanding_amount !== undefined) {
-      validateNonNegative(input.outstanding_amount, 'outstanding_amount');
-      patch.outstanding_amount = round2(input.outstanding_amount);
+      nextInstallmentAmount = input.installment_amount;
+      patch.installment_amount = round2(nextInstallmentAmount);
+      recalculatesOutstanding = true;
     }
     if (input.total_installments !== undefined) {
       validatePositiveInt(input.total_installments, 'total_installments');
-      patch.total_installments = input.total_installments;
+      nextTotalInstallments = input.total_installments;
+      patch.total_installments = nextTotalInstallments;
+      recalculatesOutstanding = true;
     }
     if (input.installments_paid !== undefined) {
       validateNonNegativeInt(input.installments_paid, 'installments_paid');
-      patch.installments_paid = input.installments_paid;
+      nextInstallmentsPaid = input.installments_paid;
+      patch.installments_paid = nextInstallmentsPaid;
+      recalculatesOutstanding = true;
+    }
+    if (nextInstallmentsPaid > nextTotalInstallments) {
+      throw new Error('installments_paid no puede ser mayor a total_installments');
     }
     if (input.first_due_date !== undefined) {
       validateIsoDate(input.first_due_date, 'first_due_date');
@@ -175,6 +358,21 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
     if (input.status !== undefined) {
       if (!isLoanStatus(input.status)) throw new Error('status inválido');
       patch.status = input.status;
+    }
+    if (recalculatesOutstanding) {
+      const outstanding = calculateDerivedOutstanding({
+        installmentAmount: nextInstallmentAmount,
+        totalInstallments: nextTotalInstallments,
+        installmentsPaid: nextInstallmentsPaid,
+      });
+      patch.outstanding_amount = round2(outstanding);
+      if (input.status === undefined) {
+        if (outstanding === 0) {
+          patch.status = 'pagada';
+        } else if (current.status === 'pagada') {
+          patch.status = 'activa';
+        }
+      }
     }
 
     if (Object.keys(patch).length === 0) return this.findById(id);
@@ -198,6 +396,27 @@ export class SupabaseLoanRepository implements LoanRepositoryPort {
       .delete()
       .eq('id', id)
       .eq('user_id', this.userId);
+    if (error) throw new Error(error.message);
+  }
+
+  private async reverseMovement(movementId: string, reason: string): Promise<void> {
+    const payload = {
+      p_user_id: this.userId,
+      p_movement_id: movementId,
+      p_deleted_by: this.userId,
+      p_reason: reason,
+    };
+    const { data, error } = await this.client.rpc('delete_movement_with_reversal_v1', payload);
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error('movement_reversal_failed');
+    const row = data as { deleted?: boolean; already_deleted?: boolean };
+    if (!row.deleted && !row.already_deleted) {
+      throw new Error('movement_reversal_failed');
+    }
+  }
+
+  private async recalcLoan(loanId: string): Promise<void> {
+    const { error } = await this.client.rpc('recalc_loan', { p_loan_id: loanId });
     if (error) throw new Error(error.message);
   }
 }
@@ -257,6 +476,13 @@ function validateIsoDate(s: string, field: string): void {
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
+function calculateDerivedOutstanding(input: {
+  installmentAmount: number;
+  totalInstallments: number;
+  installmentsPaid: number;
+}): number {
+  return input.installmentAmount * Math.max(input.totalInstallments - input.installmentsPaid, 0);
+}
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
 }
@@ -271,4 +497,68 @@ function normalizeLoanCurrency(raw?: string): string {
 
 function normalizeInstallmentStatus(v: string): LoanInstallmentRow['status'] {
   return v === 'pagada' || v === 'vencida' ? v : 'pendiente';
+}
+
+function mapLoanInstallmentRow(row: {
+  id: string;
+  loan_id: string;
+  installment_number: number;
+  due_date: string;
+  amount: number | string;
+  paid_amount: number | string;
+  status: string;
+  paid_at: string | null;
+}): LoanInstallmentRow {
+  return {
+    id: row.id,
+    loan_id: row.loan_id,
+    installment_number: Number(row.installment_number),
+    due_date: row.due_date,
+    amount: Number(row.amount),
+    paid_amount: Number(row.paid_amount),
+    status: normalizeInstallmentStatus(row.status),
+    paid_at: row.paid_at,
+  };
+}
+
+function mapLoanPaymentRow(row: Record<string, unknown>): LoanPaymentRow {
+  const loan = row.loans as Record<string, unknown> | null;
+  const movement = row.movements as Record<string, unknown> | null;
+  return {
+    id: String(row.id),
+    loan_id: String(row.loan_id),
+    loan_name: loan?.name ? String(loan.name) : 'Préstamo',
+    movement_id: String(row.movement_id),
+    amount: Number(row.amount),
+    currency: movement?.currency ? String(movement.currency) : 'ARS',
+    detail: movement?.detail ? String(movement.detail) : 'Pago de préstamo',
+    payment_date: String(row.payment_date),
+    movement_date: movement?.movement_date ? String(movement.movement_date) : String(row.payment_date),
+    created_at: row.created_at ? String(row.created_at) : new Date().toISOString(),
+  };
+}
+
+function currentMonthRange(now: Date = new Date()): {
+  monthStart: string;
+  monthEnd: string;
+  today: string;
+} {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const monthStart = new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 10);
+  const monthEnd = new Date(Date.UTC(year, month + 1, 0)).toISOString().slice(0, 10);
+  const today = now.toISOString().slice(0, 10);
+  return { monthStart, monthEnd, today };
+}
+
+function resolveInstallmentStatus(params: {
+  dueDate: string;
+  paidAmount: number;
+  amount: number;
+  today: string;
+}): LoanInstallmentRow['status'] {
+  const { dueDate, paidAmount, amount, today } = params;
+  if (paidAmount >= amount) return 'pagada';
+  if (dueDate < today) return 'vencida';
+  return 'pendiente';
 }

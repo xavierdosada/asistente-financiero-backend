@@ -19,6 +19,7 @@ describe('ProcessAdvisorMessageUseCase scope behavior', () => {
     listStatementsByCardId: jest.fn(),
     getStatementById: jest.fn(),
     generateMonthlyStatement: jest.fn(),
+    updateStatementWindow: jest.fn(),
     spendByRange: jest.fn(),
     pendingInstallmentsByCardId: jest.fn(),
     setInitialDebt: jest.fn(),
@@ -30,6 +31,9 @@ describe('ProcessAdvisorMessageUseCase scope behavior', () => {
     list: jest.fn(),
     findById: jest.fn(),
     installmentsByLoanId: jest.fn(),
+    listPayments: jest.fn(),
+    updateCurrentMonthInstallment: jest.fn(),
+    adjustPayment: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
     deleteById: jest.fn(),
@@ -130,6 +134,8 @@ describe('ProcessAdvisorMessageUseCase scope behavior', () => {
       credit_limit: 100000,
       available_current: 100000,
       available_next: 100000,
+      current_cycle: { from: '2026-03-28', to: '2026-04-27' },
+      next_cycle: { from: '2026-04-28', to: '2026-05-27' },
     });
 
     await useCase.execute({

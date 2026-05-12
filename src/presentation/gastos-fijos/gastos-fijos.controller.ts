@@ -147,7 +147,8 @@ export class GastosFijosController {
       await this.fixed.generateInstancesForMonth(targetMonth);
       const instances = await this.fixed.listInstances(targetMonth);
       await this.autoCreateCardFixedExpenseMovements(instances);
-      return await this.fixed.listInstances(targetMonth);
+      const finalInstances = await this.fixed.listInstances(targetMonth);
+      return finalInstances;
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Error interno';
       throw new HttpException(msg, HttpStatus.INTERNAL_SERVER_ERROR);
@@ -193,6 +194,7 @@ export class GastosFijosController {
         entryMode,
         `pago automático gasto fijo ${fixed.name}`,
         null,
+        null,
       );
       const saved = await this.transactions.save(movement);
       const paid = await this.fixed.markInstancePaid(instance.id, saved.id);
@@ -233,6 +235,7 @@ export class GastosFijosController {
     for (const instance of pendingCardInstances) {
       const fixed = fixedById.get(instance.fixed_expense_id);
       if (!fixed || fixed.payment_method !== 'tarjeta' || !fixed.card_id) continue;
+      const movementDate = movementDateForInstance(instance.period_month, fixed.accrual_day ?? fixed.due_day);
 
       const movement = new IngresoEgreso(
         fixed.currency,
@@ -246,10 +249,11 @@ export class GastosFijosController {
         null,
         null,
         null,
-        movementDateForInstance(instance.period_month, fixed.accrual_day ?? fixed.due_day),
+        movementDate,
         null,
         'operativo',
         `auto_registro_gasto_fijo:${fixed.id}:${instance.id}`,
+        null,
         null,
       );
       const saved = await this.transactions.save(movement);

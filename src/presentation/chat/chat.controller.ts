@@ -8,7 +8,10 @@ import {
   Post,
   Put,
 } from '@nestjs/common';
-import { ProcessChatMessageUseCase } from '../../application/process-chat-message.use-case';
+import {
+  ProcessChatMessageUseCase,
+  type ProcessChatMessageOptions,
+} from '../../application/process-chat-message.use-case';
 import {
   CHAT_PREFERENCES_REPOSITORY,
   ChatPreferencesPatch,
@@ -22,6 +25,14 @@ class ChatMessageDto {
   entry_mode?: string;
   /** ARS por 1 USD para este mensaje (gasto con tarjeta en USD). */
   usd_ars_rate?: number;
+  /** Prioridad explícita del medio seleccionado por el usuario. */
+  payment_method?: string;
+  /** Tarjeta seleccionada por el usuario cuando usa medio tarjeta. */
+  card_id?: string;
+  /** Confirmación explícita para registrar en efectivo aunque el texto mencione cuotas. */
+  allow_cash_installment?: boolean;
+  /** Tras confirmación UI: impacto de cuota no inicial en resúmenes. */
+  installment_statement_impact?: string;
 }
 
 class ChatPreferencesDto {
@@ -115,6 +126,10 @@ export class ChatController {
     const message = body?.message;
     const autoCreateCategory = body?.auto_create_category;
     const rawEntryMode = body?.entry_mode;
+    const rawPaymentMethod = body?.payment_method;
+    const rawCardId = body?.card_id;
+    const allowCashInstallment = body?.allow_cash_installment;
+    const rawInstallmentImpact = body?.installment_statement_impact;
     if (typeof message !== 'string') {
       throw new HttpException('Campo "message" requerido', HttpStatus.BAD_REQUEST);
     }
@@ -150,13 +165,73 @@ export class ChatController {
       rawEntryMode !== undefined && isEntryMode(rawEntryMode)
         ? rawEntryMode
         : undefined;
+    if (
+      rawPaymentMethod !== undefined &&
+      rawPaymentMethod !== 'efectivo' &&
+      rawPaymentMethod !== 'tarjeta'
+    ) {
+      throw new HttpException(
+        'Campo "payment_method" debe ser efectivo o tarjeta',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    if (rawCardId !== undefined && typeof rawCardId !== 'string') {
+      throw new HttpException(
+        'Campo "card_id" debe ser string cuando se envía',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    if (
+      allowCashInstallment !== undefined &&
+      typeof allowCashInstallment !== 'boolean'
+    ) {
+      throw new HttpException(
+        'Campo "allow_cash_installment" debe ser booleano',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    const paymentMethod =
+      rawPaymentMethod === 'efectivo' || rawPaymentMethod === 'tarjeta'
+        ? rawPaymentMethod
+        : undefined;
+    const cardId = typeof rawCardId === 'string' ? rawCardId.trim() : '';
+    if (paymentMethod === 'tarjeta' && !cardId) {
+      throw new HttpException(
+        'Campo "card_id" es requerido cuando payment_method=tarjeta',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    if (
+      rawInstallmentImpact !== undefined &&
+      rawInstallmentImpact !== 'closed_statement' &&
+      rawInstallmentImpact !== 'next_statement'
+    ) {
+      throw new HttpException(
+        'Campo "installment_statement_impact" debe ser closed_statement o next_statement',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
 
     try {
-      const result = await this.processChat.execute(message, {
-        autoCreateCategory,
-        entryMode,
-        usdArsRate: typeof rawUsdArs === 'number' && Number.isFinite(rawUsdArs) ? rawUsdArs : undefined,
-      });
+      const options: ProcessChatMessageOptions = {};
+      if (autoCreateCategory !== undefined) options.autoCreateCategory = autoCreateCategory;
+      if (entryMode !== undefined) options.entryMode = entryMode;
+      if (typeof rawUsdArs === 'number' && Number.isFinite(rawUsdArs)) {
+        options.usdArsRate = rawUsdArs;
+      }
+      if (paymentMethod) {
+        options.forcedPaymentMethod = paymentMethod;
+      }
+      if (paymentMethod === 'tarjeta') {
+        options.forcedCardId = cardId;
+      }
+      if (allowCashInstallment === true) {
+        options.allowCashInstallment = true;
+      }
+      if (rawInstallmentImpact === 'closed_statement' || rawInstallmentImpact === 'next_statement') {
+        options.installmentStatementImpact = rawInstallmentImpact;
+      }
+      const result = await this.processChat.execute(message, options);
       return result;
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Error interno';

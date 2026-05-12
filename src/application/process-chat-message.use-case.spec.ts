@@ -32,7 +32,9 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     usageSummaryById: jest.fn(),
     listStatementsByCardId: jest.fn(),
     getStatementById: jest.fn(),
+    payableStatementByCardId: jest.fn(),
     generateMonthlyStatement: jest.fn(),
+    updateStatementWindow: jest.fn(),
     spendByRange: jest.fn(),
     pendingInstallmentsByCardId: jest.fn(),
     setInitialDebt: jest.fn(),
@@ -43,6 +45,9 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     list: jest.fn(),
     findById: jest.fn(),
     installmentsByLoanId: jest.fn(),
+    listPayments: jest.fn(),
+    updateCurrentMonthInstallment: jest.fn(),
+    adjustPayment: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
     deleteById: jest.fn(),
@@ -94,6 +99,7 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     jest.clearAllMocks();
     categorias.list.mockResolvedValue([{ id: 'cat-1', nombre: 'Comida', icon_key: null }]);
     tarjetas.list.mockResolvedValue([]);
+    tarjetas.payableStatementByCardId.mockResolvedValue(null);
     loans.list.mockResolvedValue([]);
     parser.parse.mockResolvedValue({
       save: true,
@@ -289,14 +295,210 @@ describe('ProcessChatMessageUseCase entry mode', () => {
 
     const res = await useCase.execute(
       '16/03/26 AUGUSTO C local de ropa Cuota 02/03 $ 13.503,33 tarjeta BBVA',
+      { installmentStatementImpact: 'next_statement' },
     );
 
     expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    if (res.saved) {
+      expect(res.note).toContain('próximo resumen a cerrar');
+    }
     expect(transactions.save).toHaveBeenCalledWith(
       expect.objectContaining({
         amount: 13503.33,
         installmentsTotal: 3,
         installmentNumber: 2,
+        installmentStatementImpact: 'next_statement',
+      }),
+    );
+  });
+
+  it('success note mentions closed statement when user chose closed_statement', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    categorias.list.mockResolvedValueOnce([{ id: 'cat-ropa', nombre: 'Ropa', icon_key: null }]);
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-1',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 100000,
+      },
+    ]);
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 13503.33,
+      type: 'gasto',
+      detail: 'Augusto C',
+      categoriaNombre: 'Ropa',
+      medioPago: 'tarjeta',
+      tarjetaNombre: 'VISA BBVA',
+      movementDate: '2026-03-16',
+      installmentsTotal: 3,
+    });
+
+    const res = await useCase.execute(
+      '16/03/26 AUGUSTO C local de ropa Cuota 02/03 $ 13.503,33 tarjeta BBVA',
+      { installmentStatementImpact: 'closed_statement' },
+    );
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    if (res.saved) {
+      expect(res.note).toContain('resumen ya cerrado');
+      expect(res.note).not.toMatch(/próximo mes/i);
+    }
+  });
+
+  it('requires confirmation for non-initial card installment when impact not sent', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    categorias.list.mockResolvedValueOnce([{ id: 'cat-ropa', nombre: 'Ropa', icon_key: null }]);
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-1',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 100000,
+      },
+    ]);
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 13503.33,
+      type: 'gasto',
+      detail: 'Augusto C',
+      categoriaNombre: 'Ropa',
+      medioPago: 'tarjeta',
+      tarjetaNombre: 'VISA BBVA',
+      movementDate: '2026-03-16',
+      installmentsTotal: 3,
+    });
+
+    const res = await useCase.execute(
+      '16/03/26 AUGUSTO C local de ropa Cuota 02/03 $ 13.503,33 tarjeta BBVA',
+    );
+
+    expect(res.saved).toBe(false);
+    if (!res.saved && 'needs_confirmation' in res && res.needs_confirmation) {
+      expect(res.installment_number).toBe(2);
+      expect(res.installments_total).toBe(3);
+      expect(res.choices).toHaveLength(2);
+    }
+    expect(transactions.save).not.toHaveBeenCalled();
+  });
+
+  it('requires confirmation for C.N/M shorthand (same as Cuota N/M)', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    categorias.list.mockResolvedValueOnce([{ id: 'cat-viaje', nombre: 'Viajes', icon_key: null }]);
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-1',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 100000,
+      },
+    ]);
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 26368.48,
+      type: 'gasto',
+      detail: 'AEROLINEAS AGENCIAS',
+      categoriaNombre: 'Viajes',
+      medioPago: 'tarjeta',
+      tarjetaNombre: 'VISA BBVA',
+      movementDate: '2026-04-10',
+      installmentsTotal: 6,
+    });
+
+    const res = await useCase.execute(
+      'AEROLINEAS AGENCIAS C.02/06 26.368,48',
+    );
+
+    expect(res.saved).toBe(false);
+    if (!res.saved && 'needs_confirmation' in res && res.needs_confirmation) {
+      expect(res.installment_number).toBe(2);
+      expect(res.installments_total).toBe(6);
+    }
+    expect(transactions.save).not.toHaveBeenCalled();
+  });
+
+  it('does not save a card-looking installment as cash without explicit confirmation', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 31602.86,
+      type: 'gasto',
+      detail: 'WWW.FLYBONDI.COM',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-02-20',
+      installmentsTotal: null,
+    });
+
+    const res = await useCase.execute(
+      '20-Feb-26 WWW.FLYBONDI.COM cuota 03/03 de 31602,86',
+      { forcedPaymentMethod: 'efectivo' },
+    );
+
+    expect(res.saved).toBe(false);
+    if (!res.saved) {
+      expect(res.reason).toContain('menciona cuotas');
+    }
+    expect(transactions.save).not.toHaveBeenCalled();
+  });
+
+  it('allows a card-looking installment as cash after explicit UI confirmation', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 31602.86,
+      type: 'gasto',
+      detail: 'WWW.FLYBONDI.COM',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-02-20',
+      installmentsTotal: null,
+    });
+
+    const res = await useCase.execute(
+      '20-Feb-26 WWW.FLYBONDI.COM cuota 03/03 de 31602,86',
+      { forcedPaymentMethod: 'efectivo', allowCashInstallment: true },
+    );
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        medioPago: 'efectivo',
+        installmentsTotal: null,
       }),
     );
   });
@@ -354,6 +556,75 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     expect(transactions.save).toHaveBeenCalledWith(
       expect.objectContaining({
         amount: 25000,
+        loanId: 'loan-1',
+      }),
+    );
+  });
+
+  it('prioritizes overdue adjusted loan installment over future pending installments', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    loans.list.mockResolvedValueOnce([
+      {
+        id: 'loan-1',
+        name: 'Galenos',
+        lender: 'Galenos',
+        currency: 'ARS',
+        principal_amount: 3000000,
+        installment_amount: 109317.34,
+        outstanding_amount: 1000000,
+        total_installments: 30,
+        installments_paid: 1,
+        installments_remaining: 29,
+        first_due_date: '2026-04-03',
+        status: 'activa',
+        annual_rate: null,
+        notes: null,
+      },
+    ]);
+    loans.installmentsByLoanId.mockResolvedValueOnce([
+      {
+        id: 'inst-overdue',
+        loan_id: 'loan-1',
+        installment_number: 2,
+        due_date: '2026-05-03',
+        amount: 109317.34,
+        paid_amount: 102897.72,
+        status: 'vencida',
+        paid_at: null,
+      },
+      {
+        id: 'inst-pending',
+        loan_id: 'loan-1',
+        installment_number: 5,
+        due_date: '2026-08-03',
+        amount: 102897.72,
+        paid_amount: 0,
+        status: 'pendiente',
+        paid_at: null,
+      },
+    ]);
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: null,
+      type: 'gasto',
+      detail: 'prestamo Galenos',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-11',
+    });
+
+    const res = await useCase.execute('Pague prestamo Galenos');
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 109317.34,
         loanId: 'loan-1',
       }),
     );
@@ -497,6 +768,199 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     if (!res.saved) {
       expect(res.reason).toContain('No pude determinar el monto');
     }
+  });
+
+  it('detects explicit card statement payment even when UI forced efectivo', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-bbva',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 1000000,
+      },
+    ]);
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 100000,
+      type: 'gasto',
+      detail: 'pago tarjeta BBVA',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-10',
+    });
+
+    const res = await useCase.execute('pagué 100000 de la tarjeta BBVA', {
+      forcedPaymentMethod: 'efectivo',
+    });
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 100000,
+        medioPago: 'efectivo',
+        tarjetaId: null,
+        settledCardId: 'card-bbva',
+        sourceAccountId: 'acc-1',
+      }),
+    );
+  });
+
+  it('resolves minimum card payment from payable statement', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-bbva',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 1000000,
+      },
+    ]);
+    tarjetas.payableStatementByCardId.mockResolvedValueOnce({
+      id: 'stmt-1',
+      card_id: 'card-bbva',
+      period_year: 2026,
+      period_month: 5,
+      due_date: '2026-05-15',
+      minimum_payment: 45000,
+      outstanding_amount: 200000,
+      outstanding_amount_usd: 0,
+      status: 'cerrado',
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: null,
+      type: 'gasto',
+      detail: 'pago mínimo tarjeta BBVA',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-10',
+    });
+
+    const res = await useCase.execute('pagué el mínimo de la tarjeta BBVA');
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    expect(tarjetas.payableStatementByCardId).toHaveBeenCalledWith('card-bbva');
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 45000,
+        settledCardId: 'card-bbva',
+      }),
+    );
+  });
+
+  it('resolves total card payment from outstanding statement amount', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-bbva',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 1000000,
+      },
+    ]);
+    tarjetas.payableStatementByCardId.mockResolvedValueOnce({
+      id: 'stmt-1',
+      card_id: 'card-bbva',
+      period_year: 2026,
+      period_month: 5,
+      due_date: '2026-05-15',
+      minimum_payment: 45000,
+      outstanding_amount: 200000,
+      outstanding_amount_usd: 0,
+      status: 'cerrado',
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: null,
+      type: 'gasto',
+      detail: 'pago resumen tarjeta BBVA',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-10',
+    });
+
+    const res = await useCase.execute('pagué el total del resumen de la tarjeta BBVA');
+
+    expect(res).toMatchObject({ saved: true, id: 'mov-1' });
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 200000,
+        settledCardId: 'card-bbva',
+      }),
+    );
+  });
+
+  it('asks for amount when implicit card payment has no payable minimum', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    tarjetas.list.mockResolvedValueOnce([
+      {
+        id: 'card-bbva',
+        name: 'VISA BBVA (credito)',
+        bank: 'BBVA',
+        type_card: 'credito',
+        payment_card: 'VISA',
+        credit_limit: 1000000,
+      },
+    ]);
+    tarjetas.payableStatementByCardId.mockResolvedValueOnce({
+      id: 'stmt-1',
+      card_id: 'card-bbva',
+      period_year: 2026,
+      period_month: 5,
+      due_date: '2026-05-15',
+      minimum_payment: 0,
+      outstanding_amount: 200000,
+      outstanding_amount_usd: 0,
+      status: 'cerrado',
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: null,
+      type: 'gasto',
+      detail: 'pago mínimo tarjeta BBVA',
+      categoriaNombre: 'Comida',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-10',
+    });
+
+    const res = await useCase.execute('pagué el mínimo de la tarjeta BBVA');
+
+    expect(res.saved).toBe(false);
+    if (!res.saved) {
+      expect(res.reason).toContain('Indicá el importe');
+    }
+    expect(transactions.save).not.toHaveBeenCalled();
   });
 
   it('rejects card spend USD without usd fx', async () => {

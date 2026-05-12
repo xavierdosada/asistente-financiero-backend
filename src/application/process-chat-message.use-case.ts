@@ -1,6 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { IngresoEgreso } from '../domain/entities/ingreso-egreso.entity';
-import type { MedioPago } from '../domain/entities/ingreso-egreso.entity';
+import {
+  IngresoEgreso,
+  type InstallmentStatementImpact,
+  type MedioPago,
+} from '../domain/entities/ingreso-egreso.entity';
 import type { EntryMode } from '../domain/ports/entry-mode.port';
 import {
   AI_TRANSACTION_PARSER,
@@ -13,6 +16,7 @@ import {
 import {
   TARJETA_REPOSITORY,
   TarjetaRepositoryPort,
+  type CardPayableStatementRow,
   type TarjetaRow,
 } from '../domain/ports/tarjeta-repository.port';
 import {
@@ -43,13 +47,30 @@ import {
 
 export type ProcessChatMessageResult =
   | { saved: true; id: string; note?: string }
-  | { saved: false; reason: string };
+  | { saved: false; reason: string; needs_confirmation?: false }
+  | {
+      saved: false;
+      needs_confirmation: true;
+      reason: string;
+      prompt: string;
+      installment_number: number;
+      installments_total: number;
+      choices: Array<{ id: InstallmentStatementImpact; label: string }>;
+    };
 
 export type ProcessChatMessageOptions = {
   autoCreateCategory?: boolean;
   entryMode?: EntryMode;
   /** ARS por 1 USD para este guardado (gasto con tarjeta en USD). */
   usdArsRate?: number;
+  /** Prioriza explícitamente el medio elegido en UI sobre el parser. */
+  forcedPaymentMethod?: MedioPago;
+  /** Tarjeta elegida en UI cuando forcedPaymentMethod=tarjeta. */
+  forcedCardId?: string;
+  /** Confirmación explícita de UI para permitir una frase con cuotas en efectivo. */
+  allowCashInstallment?: boolean;
+  /** Tras confirmación UI: en qué resumen impacta una cuota no inicial (N>1). */
+  installmentStatementImpact?: InstallmentStatementImpact;
 };
 
 type CatalogRow = { id: string; nombre: string };
@@ -136,6 +157,13 @@ export class ProcessChatMessageUseCase {
     const autoCreateCategory =
       options.autoCreateCategory ?? preferences.auto_create_category_default;
     const entryMode = options.entryMode ?? preferences.default_entry_mode;
+    const forcedPaymentMethod = options.forcedPaymentMethod;
+    const forcedCardId =
+      typeof options.forcedCardId === 'string' && options.forcedCardId.trim().length > 0 ?
+        options.forcedCardId.trim()
+      : null;
+    const hasForcedPaymentConfig =
+      forcedPaymentMethod === 'efectivo' || forcedPaymentMethod === 'tarjeta';
     const currencyNorm = normalizeCurrencyCode(parsed.currency);
 
     const categoriaId = await this.resolveOrCreateCategoryId(
@@ -154,21 +182,47 @@ export class ProcessChatMessageUseCase {
     const isLoanPayment = this.isLoanPayment(trimmed, parsed.detail);
     const isCardBillPayment =
       !isLoanPayment && this.isCardBillPayment(trimmed, parsed.detail);
+    const usingForcedPaymentConfig =
+      hasForcedPaymentConfig && !isLoanPayment && !isCardBillPayment;
+    const movementType: 'ingreso' | 'gasto' =
+      isLoanPayment || isCardBillPayment ? 'gasto' : parsed.type;
     const medioPago: MedioPago =
-      isCardBillPayment || isLoanPayment ? 'efectivo' : parsed.medioPago;
+      usingForcedPaymentConfig ? forcedPaymentMethod
+      : isCardBillPayment || isLoanPayment ? 'efectivo'
+      : parsed.medioPago;
 
     let tarjetaId = this.resolveTarjetaId(
       medioPago,
       parsed.tarjetaNombre,
       tarjetasCatalog,
     );
+    if (usingForcedPaymentConfig) {
+      if (forcedPaymentMethod === 'tarjeta') {
+        if (!forcedCardId) {
+          return {
+            saved: false,
+            reason: 'Seleccioná una tarjeta para registrar el movimiento con medio tarjeta.',
+          };
+        }
+        const cardExists = tarjetasCatalog.some((card) => card.id === forcedCardId);
+        if (!cardExists) {
+          return {
+            saved: false,
+            reason: 'La tarjeta seleccionada ya no está disponible. Actualizá la selección.',
+          };
+        }
+        tarjetaId = forcedCardId;
+      } else {
+        tarjetaId = null;
+      }
+    }
 
     const installmentsTotal = this.resolveInstallmentsTotal(
       trimmed,
       parsed.detail,
       parsed.installmentsTotal ?? null,
       medioPago,
-      parsed.type,
+      movementType,
     );
     const installmentNumber = installmentsTotal
       ? this.resolveInstallmentNumber(trimmed, parsed.detail, installmentsTotal)
@@ -195,7 +249,10 @@ export class ProcessChatMessageUseCase {
           parsed.detail,
           parsed.tarjetaNombre,
           tarjetasCatalog,
-        )
+        ) ??
+        (forcedCardId && tarjetasCatalog.some((card) => card.id === forcedCardId) ?
+          forcedCardId
+        : null)
       : null;
 
     const loanMatch = isLoanPayment
@@ -235,6 +292,21 @@ export class ProcessChatMessageUseCase {
       };
     }
 
+    if (
+      medioPago === 'efectivo' &&
+      movementType === 'gasto' &&
+      !options.allowCashInstallment &&
+      !isLoanPayment &&
+      !isCardBillPayment &&
+      this.looksLikeCardInstallment(trimmed, parsed.detail)
+    ) {
+      return {
+        saved: false,
+        reason:
+          'El mensaje menciona cuotas pero el medio seleccionado es efectivo. Confirmá si querés registrarlo en efectivo o elegí una tarjeta.',
+      };
+    }
+
     if (medioPago === 'efectivo' && !isSupportedCashCurrency(currencyNorm)) {
       return {
         saved: false,
@@ -252,6 +324,11 @@ export class ProcessChatMessageUseCase {
       parsed.amount,
       isLoanPayment,
       loanMatch,
+      isCardBillPayment,
+      settledCardId,
+      trimmed,
+      parsed.detail,
+      currencyNorm,
     );
     const amountFromFixed =
       fixedMatch && fixedPaymentIntent && parsed.amount === null ? fixedMatch.amount : null;
@@ -260,12 +337,14 @@ export class ProcessChatMessageUseCase {
       return {
         saved: false,
         reason:
-          'No pude determinar el monto de la cuota para ese préstamo. Revisá el préstamo o su plan de cuotas.',
+          isCardBillPayment ?
+            this.cardPaymentMissingAmountReason(trimmed, parsed.detail)
+          : 'No pude determinar el monto de la cuota para ese préstamo. Revisá el préstamo o su plan de cuotas.',
       };
     }
 
     const fxArsPerUsd = resolveFxArsPerUsdForSave({
-      type: parsed.type,
+      type: movementType,
       medioPago,
       currency: currencyNorm,
       optionsUsd: options.usdArsRate,
@@ -279,10 +358,48 @@ export class ProcessChatMessageUseCase {
       };
     }
 
+    const instNumForUi = installmentNumber ?? 1;
+    const isNonInitialInstallment =
+      entryMode === 'operativo' &&
+      movementType === 'gasto' &&
+      medioPago === 'tarjeta' &&
+      tarjetaId !== null &&
+      installmentsTotal !== null &&
+      installmentsTotal > 1 &&
+      instNumForUi > 1 &&
+      !isLoanPayment &&
+      !isCardBillPayment;
+
+    if (isNonInitialInstallment && !options.installmentStatementImpact) {
+      return {
+        saved: false,
+        needs_confirmation: true,
+        reason: 'Confirmá en qué resumen debe impactar la cuota.',
+        prompt: `Estás registrando la cuota ${instNumForUi} de ${installmentsTotal}. ¿En cuál resumen debe impactar?`,
+        installment_number: instNumForUi,
+        installments_total: installmentsTotal,
+        choices: [
+          {
+            id: 'closed_statement',
+            label: 'Resumen ya cerrado (a pagar este mes)',
+          },
+          {
+            id: 'next_statement',
+            label: 'Próximo resumen a cerrar (ya llevas gastado el próximo ciclo)',
+          },
+        ],
+      };
+    }
+
+    const installmentImpactForEntity: InstallmentStatementImpact | null =
+      isNonInitialInstallment && options.installmentStatementImpact ?
+        options.installmentStatementImpact
+      : null;
+
     const entity = new IngresoEgreso(
       currencyNorm,
       finalAmount,
-      parsed.type,
+      movementType,
       parsed.detail,
       categoriaId,
       medioPago,
@@ -296,6 +413,7 @@ export class ProcessChatMessageUseCase {
       entryMode,
       trimmed,
       fxArsPerUsd,
+      installmentImpactForEntity,
     );
 
     if (!this.isValidEntity(entity)) {
@@ -319,10 +437,7 @@ export class ProcessChatMessageUseCase {
     }
 
     const notes: string[] = [];
-    const installmentNote =
-      entity.installmentsTotal && entity.installmentNumber ?
-        `Se agregó el gasto de la cuota número ${entity.installmentNumber} para el próximo mes.`
-      : undefined;
+    const installmentNote = this.buildInstallmentSuccessNote(entity);
     if (installmentNote) notes.push(installmentNote);
     const budgetNote = await this.buildBudgetNote(entity);
     if (budgetNote) notes.push(budgetNote);
@@ -363,6 +478,25 @@ export class ProcessChatMessageUseCase {
     if (!cardId) return null;
     const card = cards.find((c) => c.id === cardId);
     return card?.name ?? null;
+  }
+
+  private buildInstallmentSuccessNote(entity: IngresoEgreso): string | undefined {
+    const total = entity.installmentsTotal;
+    const n = entity.installmentNumber;
+    if (!total || !n || total <= 1) return undefined;
+    if (entity.type !== 'gasto' || entity.medioPago !== 'tarjeta') return undefined;
+
+    if (n > 1) {
+      if (entity.installmentStatementImpact === 'closed_statement') {
+        return `Se agregó la cuota ${n} de ${total} al resumen ya cerrado (impacta en el cierre que estás pagando ahora).`;
+      }
+      if (entity.installmentStatementImpact === 'next_statement') {
+        return `Se agregó la cuota ${n} de ${total} para el próximo resumen a cerrar.`;
+      }
+      return `Se registró la cuota ${n} de ${total}.`;
+    }
+
+    return `Se registró la compra en ${total} cuotas; la cuota 1 impactará en el próximo cierre de resumen.`;
   }
 
   private async buildBudgetNote(entity: IngresoEgreso): Promise<string | null> {
@@ -543,9 +677,29 @@ export class ProcessChatMessageUseCase {
     parsedAmount: number | null,
     isLoanPayment: boolean,
     loanMatch: LoanMatchResult | null,
+    isCardBillPayment: boolean,
+    settledCardId: string | null,
+    message: string,
+    detail: string,
+    currency: string,
   ): Promise<number | null> {
     if (Number.isFinite(parsedAmount) && (parsedAmount as number) > 0) {
       return parsedAmount as number;
+    }
+    if (isCardBillPayment) {
+      if (!settledCardId) return null;
+      const statement = await this.tarjetas.payableStatementByCardId(settledCardId);
+      if (!statement) return null;
+
+      if (this.isMinimumCardPaymentRequest(message, detail)) {
+        return positiveOrNull(statement.minimum_payment);
+      }
+
+      if (this.isTotalCardPaymentRequest(message, detail)) {
+        return positiveOrNull(this.payableOutstandingForCurrency(statement, currency));
+      }
+
+      return null;
     }
     if (!isLoanPayment || !loanMatch || loanMatch.status !== 'single') return null;
 
@@ -555,14 +709,46 @@ export class ProcessChatMessageUseCase {
     const pending = installments
       .filter((i) => i.status === 'pendiente')
       .sort((a, b) => (a.due_date < b.due_date ? -1 : a.due_date > b.due_date ? 1 : 0));
-    if (pending[0] && pending[0].amount > 0) return pending[0].amount;
-
-    const overdue = installments
+    const overdueBeforePending = installments
       .filter((i) => i.status === 'vencida')
       .sort((a, b) => (a.due_date < b.due_date ? -1 : a.due_date > b.due_date ? 1 : 0));
-    if (overdue[0] && overdue[0].amount > 0) return overdue[0].amount;
+    if (overdueBeforePending[0] && overdueBeforePending[0].amount > 0) {
+      return overdueBeforePending[0].amount;
+    }
+    if (pending[0] && pending[0].amount > 0) {
+      return pending[0].amount;
+    }
 
     return null;
+  }
+
+  private payableOutstandingForCurrency(
+    statement: CardPayableStatementRow,
+    currency: string,
+  ): number {
+    return currency.trim().toUpperCase() === 'USD' ?
+        statement.outstanding_amount_usd
+      : statement.outstanding_amount;
+  }
+
+  private isMinimumCardPaymentRequest(message: string, detail: string): boolean {
+    const source = norm(`${message} ${detail}`);
+    return /\b(minimo|pago minimo|minima)\b/.test(source);
+  }
+
+  private isTotalCardPaymentRequest(message: string, detail: string): boolean {
+    const source = norm(`${message} ${detail}`);
+    return /\b(total|saldo|resumen|todo|completo|cancelar|cancelo|cancele)\b/.test(source);
+  }
+
+  private cardPaymentMissingAmountReason(message: string, detail: string): string {
+    if (this.isMinimumCardPaymentRequest(message, detail)) {
+      return 'No pude determinar el pago mínimo vigente de esa tarjeta. Indicá el importe pagado.';
+    }
+    if (this.isTotalCardPaymentRequest(message, detail)) {
+      return 'No pude determinar el saldo pendiente vigente de esa tarjeta. Indicá el importe pagado.';
+    }
+    return 'No pude determinar el monto del pago de tarjeta. Indicá el importe pagado.';
   }
 
   private isValidEntity(e: IngresoEgreso): boolean {
@@ -633,12 +819,48 @@ export class ProcessChatMessageUseCase {
         if (next >= 1 && next <= installmentsTotal) return next;
       }
     }
-    const explicit = /\bcuota\s*(\d{1,3})\b/.exec(source);
+
+    const fromSlashWhenTotalMatches = (re: RegExp): number | null => {
+      const m = re.exec(source);
+      if (!m) return null;
+      const current = Number.parseInt(m[1], 10);
+      const slashTotal = Number.parseInt(m[2], 10);
+      if (
+        !Number.isInteger(current) ||
+        !Number.isInteger(slashTotal) ||
+        slashTotal !== installmentsTotal
+      ) {
+        return null;
+      }
+      if (current >= 1 && current <= installmentsTotal) return current;
+      return null;
+    };
+
+    for (const re of [
+      /\bcuotas?\s*(\d{1,3})\s*\/\s*(\d{1,3})\b/,
+      /\bc\.\s*(\d{1,3})\s*\/\s*(\d{1,3})\b/,
+    ]) {
+      const hit = fromSlashWhenTotalMatches(re);
+      if (hit !== null) return hit;
+    }
+
+    const explicit = /\bcuotas?\s*(\d{1,3})\b/.exec(source);
     if (explicit) {
       const number = Number.parseInt(explicit[1], 10);
       if (Number.isInteger(number) && number >= 1 && number <= installmentsTotal) return number;
     }
     return 1;
+  }
+
+  private looksLikeCardInstallment(message: string, detail: string): boolean {
+    const source = norm(`${message} ${detail}`);
+    return (
+      /\bcuotas?\s*\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
+      /\bc\.\s*\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
+      /\bcuotas?\s*\d{1,3}\b/.test(source) ||
+      /\b\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
+      /\b(?:en\s*)?\d{1,3}\s*cuotas?\b/.test(source)
+    );
   }
 
   private async inferTarjetaIdFromInstallmentContext(
@@ -730,6 +952,10 @@ function formatMoney(value: number): string {
 
 function formatPct(value: number): string {
   return `${Math.max(0, value).toFixed(1)}%`;
+}
+
+function positiveOrNull(value: number): number | null {
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function resolveFxArsPerUsdForSave(params: {

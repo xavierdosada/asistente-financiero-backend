@@ -20,7 +20,7 @@ export class MovimientosController {
   @Patch(':id')
   async updateCategory(
     @Param('id') id: string,
-    @Body() body?: { category_id?: string | null; detail?: string },
+    @Body() body?: { category_id?: string | null; detail?: string; amount?: number | string },
   ) {
     const trimmedId = id?.trim();
     if (!trimmedId) {
@@ -29,9 +29,10 @@ export class MovimientosController {
     if (
       !body ||
       (!Object.prototype.hasOwnProperty.call(body, 'category_id') &&
-        !Object.prototype.hasOwnProperty.call(body, 'detail'))
+        !Object.prototype.hasOwnProperty.call(body, 'detail') &&
+        !Object.prototype.hasOwnProperty.call(body, 'amount'))
     ) {
-      throw new HttpException('Enviá category_id o detail', HttpStatus.BAD_REQUEST);
+      throw new HttpException('Enviá category_id, detail o amount', HttpStatus.BAD_REQUEST);
     }
     const categoryIdRaw = body.category_id;
     const hasCategoryId = Object.prototype.hasOwnProperty.call(body, 'category_id');
@@ -50,12 +51,20 @@ export class MovimientosController {
     if (detail === null) {
       throw new HttpException('detail inválido', HttpStatus.BAD_REQUEST);
     }
+    const hasAmount = Object.prototype.hasOwnProperty.call(body, 'amount');
+    const amount =
+      hasAmount ? Number(body.amount)
+      : undefined;
+    if (hasAmount && (amount === undefined || !Number.isFinite(amount) || amount <= 0)) {
+      throw new HttpException('amount inválido', HttpStatus.BAD_REQUEST);
+    }
 
     try {
       const updated = await this.movements.updateById(trimmedId, {
         category_id:
           hasCategoryId ? categoryId : undefined,
         detail,
+        amount,
       });
       if (!updated) {
         throw new NotFoundException('Movimiento no encontrado');
@@ -66,6 +75,18 @@ export class MovimientosController {
       const msg = e instanceof Error ? e.message : 'Error interno';
       if (msg.includes('category_not_found')) {
         throw new HttpException('Categoría no encontrada', HttpStatus.BAD_REQUEST);
+      }
+      if (msg.includes('amount_edit_payment_not_supported')) {
+        throw new HttpException(
+          'Por ahora no se puede editar el monto de pagos ya imputados a préstamos o tarjetas.',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      if (msg.includes('amount_below_paid_card_installment')) {
+        throw new HttpException(
+          'El nuevo monto no puede ser menor que cuotas de tarjeta ya pagadas.',
+          HttpStatus.BAD_REQUEST,
+        );
       }
       throw new HttpException(msg, HttpStatus.INTERNAL_SERVER_ERROR);
     }

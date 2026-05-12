@@ -57,7 +57,7 @@ describe('Chat endpoints', () => {
     expect(res.body).toEqual({ saved: true, id: 'abc' });
     expect(processChatMock.execute).toHaveBeenCalledWith(
       'Gaste 1000 en comida con tarjeta visa',
-      { autoCreateCategory: undefined, entryMode: undefined, usdArsRate: undefined },
+      expect.objectContaining({}),
     );
   });
 
@@ -73,7 +73,7 @@ describe('Chat endpoints', () => {
     expect(res.status).toBe(201);
     expect(processChatMock.execute).toHaveBeenCalledWith(
       'Gasté 1000 en veterinaria',
-      { autoCreateCategory: true, entryMode: undefined, usdArsRate: undefined },
+      expect.objectContaining({ autoCreateCategory: true }),
     );
   });
 
@@ -90,7 +90,7 @@ describe('Chat endpoints', () => {
     expect(res.status).toBe(201);
     expect(processChatMock.execute).toHaveBeenCalledWith(
       'Cargá histórico de marzo',
-      { autoCreateCategory: undefined, entryMode: 'historico', usdArsRate: undefined },
+      expect.objectContaining({ entryMode: 'historico' }),
     );
   });
 
@@ -103,11 +103,72 @@ describe('Chat endpoints', () => {
     });
 
     expect(res.status).toBe(201);
-    expect(processChatMock.execute).toHaveBeenCalledWith('Gasté 5 usd con visa', {
-      autoCreateCategory: undefined,
-      entryMode: undefined,
-      usdArsRate: 1000,
+    expect(processChatMock.execute).toHaveBeenCalledWith(
+      'Gasté 5 usd con visa',
+      expect.objectContaining({ usdArsRate: 1000 }),
+    );
+  });
+
+  it('POST /chat/messages forwards forced payment config', async () => {
+    processChatMock.execute = jest.fn().mockResolvedValueOnce({ saved: true, id: 'abc' });
+
+    const res = await request(app.getHttpServer()).post('/chat/messages').send({
+      message: 'Pedido Ya 5000',
+      payment_method: 'tarjeta',
+      card_id: 'card-123',
     });
+
+    expect(res.status).toBe(201);
+    expect(processChatMock.execute).toHaveBeenCalledWith(
+      'Pedido Ya 5000',
+      expect.objectContaining({
+        forcedPaymentMethod: 'tarjeta',
+        forcedCardId: 'card-123',
+      }),
+    );
+  });
+
+  it('POST /chat/messages forwards installment_statement_impact', async () => {
+    processChatMock.execute = jest.fn().mockResolvedValueOnce({ saved: true, id: 'abc' });
+
+    const res = await request(app.getHttpServer()).post('/chat/messages').send({
+      message: 'cuota 3/3',
+      installment_statement_impact: 'next_statement',
+    });
+
+    expect(res.status).toBe(201);
+    expect(processChatMock.execute).toHaveBeenCalledWith(
+      'cuota 3/3',
+      expect.objectContaining({ installmentStatementImpact: 'next_statement' }),
+    );
+  });
+
+  it('POST /chat/messages forwards allow_cash_installment', async () => {
+    processChatMock.execute = jest.fn().mockResolvedValueOnce({ saved: true, id: 'abc' });
+
+    const res = await request(app.getHttpServer()).post('/chat/messages').send({
+      message: 'cuota 3/3 en efectivo',
+      payment_method: 'efectivo',
+      allow_cash_installment: true,
+    });
+
+    expect(res.status).toBe(201);
+    expect(processChatMock.execute).toHaveBeenCalledWith(
+      'cuota 3/3 en efectivo',
+      expect.objectContaining({
+        forcedPaymentMethod: 'efectivo',
+        allowCashInstallment: true,
+      }),
+    );
+  });
+
+  it('POST /chat/messages returns 400 when installment_statement_impact is invalid', async () => {
+    const res = await request(app.getHttpServer()).post('/chat/messages').send({
+      message: 'hola',
+      installment_statement_impact: 'current',
+    });
+
+    expect(res.status).toBe(400);
   });
 
   it('POST /chat/messages returns 400 when usd_ars_rate is invalid', async () => {

@@ -1,7 +1,7 @@
 import { Inject, Injectable, Scope } from '@nestjs/common';
 import { REQUEST } from '@nestjs/core';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { IngresoEgreso } from '../../domain/entities/ingreso-egreso.entity';
+import { IngresoEgreso, type InstallmentStatementImpact } from '../../domain/entities/ingreso-egreso.entity';
 import { TransactionRepositoryPort } from '../../domain/ports/transaction-repository.port';
 import type { AuthenticatedRequest } from '../../auth/auth.types';
 import { getAuthenticatedUserId } from '../../auth/request-user.util';
@@ -70,11 +70,18 @@ export class SupabaseTransactionRepository implements TransactionRepositoryPort 
     if (!row.tarjetaId) return;
     if (!row.installmentsTotal || row.installmentsTotal <= 1) return;
 
-    const firstDueDate = addMonthsIso(row.movementDate, 1);
     const installmentNumber = normalizeInstallmentNumber(
       row.installmentNumber,
       row.installmentsTotal,
     );
+    const impact = row.installmentStatementImpact;
+    const firstDueDate =
+      installmentNumber > 1 && (impact === 'closed_statement' || impact === 'next_statement') ?
+        addMonthsIso(
+          await this.resolveTargetCloseDateForNonInitialInstallment(row.tarjetaId, impact),
+          -(installmentNumber - 1),
+        )
+      : addMonthsIso(row.movementDate, 1);
     const installmentsPaid = Math.max(installmentNumber - 1, 0);
 
     const isUsdWithFx =
@@ -109,6 +116,76 @@ export class SupabaseTransactionRepository implements TransactionRepositoryPort 
     if (error.code === '23505') return;
     throw new Error(error.message);
   }
+
+  private async resolveTargetCloseDateForNonInitialInstallment(
+    cardId: string,
+    impact: InstallmentStatementImpact,
+  ): Promise<string> {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: currentPayable, error } = await this.client
+      .from('card_statements')
+      .select('closed_at, due_date')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .in('status', ['cerrado', 'vencido'])
+      .gte('due_date', today)
+      .order('due_date', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+
+    if (currentPayable?.closed_at) {
+      const closedAt = String(currentPayable.closed_at).slice(0, 10);
+      return impact === 'closed_statement' ? closedAt : addMonthsIso(closedAt, 1);
+    }
+
+    const { data: latestClosed, error: latestError } = await this.client
+      .from('card_statements')
+      .select('closed_at')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .in('status', ['cerrado', 'vencido'])
+      .lte('closed_at', today)
+      .order('closed_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (latestError) throw new Error(latestError.message);
+    if (latestClosed?.closed_at) {
+      const closedAt = String(latestClosed.closed_at).slice(0, 10);
+      return impact === 'closed_statement' ? closedAt : addMonthsIso(closedAt, 1);
+    }
+
+    return computeFallbackTargetCloseDateForNonInitialInstallment(impact);
+  }
+}
+
+/**
+ * Fallback sin resumen creado: ancla al fin de mes calendario actual o al siguiente.
+ */
+function computeFallbackTargetCloseDateForNonInitialInstallment(
+  impact: InstallmentStatementImpact,
+): string {
+  const today = new Date();
+  const y = today.getUTCFullYear();
+  const m = today.getUTCMonth() + 1;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const lastDayOfMonth = (year: number, month1to12: number) =>
+    new Date(Date.UTC(year, month1to12, 0)).getUTCDate();
+  const endOfMonthIso = (year: number, month1to12: number) => {
+    const d = lastDayOfMonth(year, month1to12);
+    return `${year}-${pad(month1to12)}-${pad(d)}`;
+  };
+  let ty = y;
+  let tm = m;
+  if (impact === 'next_statement') {
+    if (tm === 12) {
+      ty += 1;
+      tm = 1;
+    } else {
+      tm += 1;
+    }
+  }
+  return endOfMonthIso(ty, tm);
 }
 
 function addMonthsIso(isoDate: string, months: number): string {

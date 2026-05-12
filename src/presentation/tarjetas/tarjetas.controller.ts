@@ -18,6 +18,7 @@ import {
   isTypeCard,
 } from '../../domain/ports/tarjeta-repository.port';
 import { isEntryScope } from '../../domain/ports/entry-mode.port';
+import { parseMoneyAmountInput } from '../../lib/parse-money-amount';
 
 /** Ejemplo: { "bank": "NARANJA", "type_card": "credito", "payment_card": "VISA" } */
 class CreateTarjetaDto {
@@ -42,12 +43,22 @@ class UpdateTarjetaDto {
 class GenerateStatementDto {
   year?: number;
   month?: number;
+  opened_at?: string;
+  closed_at?: string;
+  due_date?: string;
+}
+
+class UpdateStatementWindowDto {
+  opened_at?: string;
+  closed_at?: string;
+  due_date?: string;
 }
 
 class SetInitialDebtDto {
   year!: number;
   month!: number;
-  outstanding_amount!: number;
+  /** Número JSON o string con formato es-AR (ej. `892754,96` o `"892.754,96"`). */
+  outstanding_amount!: number | string;
   due_date?: string;
 }
 
@@ -132,23 +143,14 @@ export class TarjetasController {
       throw new HttpException('id requerido', HttpStatus.BAD_REQUEST);
     }
     const cardId = id.trim();
-    console.log('[tarjetas.cuotas-pendientes] request', { card_id: cardId });
     try {
       const result = await this.tarjetas.pendingInstallmentsByCardId(cardId);
       if (!result) {
-        console.log('[tarjetas.cuotas-pendientes] tarjeta no encontrada', { card_id: cardId });
         throw new NotFoundException('Tarjeta no encontrada');
       }
-      console.log('[tarjetas.cuotas-pendientes] ok', {
-        card_id: cardId,
-        pending_count: result.pending_count,
-        total_remaining_amount: result.total_remaining_amount,
-        installments_len: result.installments?.length,
-      });
       return result;
     } catch (e) {
       if (e instanceof NotFoundException) throw e;
-      console.log('[tarjetas.cuotas-pendientes] error', e);
       const msg = e instanceof Error ? e.message : 'Error interno';
       throw new HttpException(msg, HttpStatus.INTERNAL_SERVER_ERROR);
     }
@@ -229,6 +231,52 @@ export class TarjetasController {
     }
   }
 
+  @Patch(':id/resumenes/:statementId')
+  async updateStatementWindow(
+    @Param('id') id: string,
+    @Param('statementId') statementId: string,
+    @Body() body: UpdateStatementWindowDto,
+  ) {
+    if (!id?.trim() || !statementId?.trim()) {
+      throw new HttpException('id y statementId requeridos', HttpStatus.BAD_REQUEST);
+    }
+    const patch: { opened_at?: string; closed_at?: string; due_date?: string } = {};
+    if (body.opened_at !== undefined) {
+      if (typeof body.opened_at !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.opened_at)) {
+        throw new HttpException('opened_at inválida (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);
+      }
+      patch.opened_at = body.opened_at;
+    }
+    if (body.closed_at !== undefined) {
+      if (typeof body.closed_at !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.closed_at)) {
+        throw new HttpException('closed_at inválida (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);
+      }
+      patch.closed_at = body.closed_at;
+    }
+    if (body.due_date !== undefined) {
+      if (typeof body.due_date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.due_date)) {
+        throw new HttpException('due_date inválida (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);
+      }
+      patch.due_date = body.due_date;
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new HttpException(
+        'Enviá al menos uno de: opened_at, closed_at, due_date',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    try {
+      const row = await this.tarjetas.updateStatementWindow(id.trim(), statementId.trim(), patch);
+      if (!row) throw new NotFoundException('Resumen no encontrado');
+      return row;
+    } catch (e) {
+      if (e instanceof NotFoundException) throw e;
+      const msg = e instanceof Error ? e.message : 'Error interno';
+      throw new HttpException(msg, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+  }
+
   @Post(':id/resumenes/generar')
   async generateStatement(
     @Param('id') id: string,
@@ -256,8 +304,44 @@ export class TarjetasController {
       throw new HttpException('month inválido', HttpStatus.BAD_REQUEST);
     }
 
+    const hasWindowPart =
+      body?.opened_at !== undefined ||
+      body?.closed_at !== undefined ||
+      body?.due_date !== undefined;
+    if (hasWindowPart) {
+      if (typeof body?.opened_at !== 'string' || typeof body?.closed_at !== 'string') {
+        throw new HttpException(
+          'Para ventana personalizada, opened_at y closed_at son requeridos',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(body.opened_at) || !/^\d{4}-\d{2}-\d{2}$/.test(body.closed_at)) {
+        throw new HttpException('opened_at/closed_at inválidos (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);
+      }
+      if (
+        body.due_date !== undefined &&
+        (typeof body.due_date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.due_date))
+      ) {
+        throw new HttpException('due_date inválida (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);
+      }
+    }
+
+    const windowOverride =
+      hasWindowPart ?
+        {
+          opened_at: body!.opened_at!,
+          closed_at: body!.closed_at!,
+          due_date: body!.due_date,
+        }
+      : undefined;
+
     try {
-      const row = await this.tarjetas.generateMonthlyStatement(id.trim(), year, month);
+      const row = await this.tarjetas.generateMonthlyStatement(
+        id.trim(),
+        year,
+        month,
+        windowOverride,
+      );
       if (!row) throw new NotFoundException('Tarjeta no encontrada');
       return row;
     } catch (e) {
@@ -277,7 +361,7 @@ export class TarjetasController {
     }
     const year = Number(body?.year);
     const month = Number(body?.month);
-    const outstandingAmount = Number(body?.outstanding_amount);
+    const outstandingAmount = parseMoneyAmountInput(body?.outstanding_amount);
     const dueDate = body?.due_date;
 
     if (!Number.isInteger(year) || year < 2000 || year > 2100) {
@@ -287,7 +371,10 @@ export class TarjetasController {
       throw new HttpException('month inválido', HttpStatus.BAD_REQUEST);
     }
     if (!Number.isFinite(outstandingAmount) || outstandingAmount < 0) {
-      throw new HttpException('outstanding_amount inválido', HttpStatus.BAD_REQUEST);
+      throw new HttpException(
+        'outstanding_amount inválido: usá número JSON (892754.96) o string es-AR (892754,96 / 892.754,96)',
+        HttpStatus.BAD_REQUEST,
+      );
     }
     if (dueDate !== undefined && (typeof dueDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate))) {
       throw new HttpException('due_date inválida (YYYY-MM-DD)', HttpStatus.BAD_REQUEST);

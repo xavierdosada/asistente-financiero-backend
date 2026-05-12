@@ -20,12 +20,29 @@ export type TarjetaUsageSummary = {
   month_next: string;
   spent_current: number;
   spent_next: number;
+  /** Gastos del mes calendario en USD (sin convertir a ARS). */
+  spent_current_usd?: number;
+  /** Gastos del mes siguiente en USD. */
+  spent_next_usd?: number;
+  /** Suma de `outstanding_amount` de resúmenes con `due_date` en el mes calendario actual (tarjeta crédito). */
   pending_month_debt: number;
+  /** Suma de `outstanding_amount_usd` en esos mismos resúmenes. */
+  pending_month_debt_usd?: number;
+  /** Pagos de tarjeta sin imputar a ningún resumen (saldo a favor). */
   pending_month_credit: number;
+  /** Saldo a favor en USD (pagos USD no asignados). */
+  pending_month_credit_usd?: number;
+  /** Consumo del ciclo abierto (1 pago + cuotas del período de cierre actual). */
   next_month_debt: number;
+  /** Consumo del ciclo abierto en USD. */
+  next_month_debt_usd?: number;
   credit_limit: number | null;
   available_current: number | null;
   available_next: number | null;
+  /** Ventana del ciclo actual (opened_at..closed_at reales o por día de cierre). */
+  current_cycle: { from: string; to: string };
+  /** Ventana del ciclo siguiente. */
+  next_cycle: { from: string; to: string };
 };
 
 export type TarjetaDebtInstallmentRow = {
@@ -64,16 +81,38 @@ export type CardStatementRow = {
   total_amount: number;
   paid_amount: number;
   outstanding_amount: number;
+  total_amount_usd: number;
+  paid_amount_usd: number;
+  outstanding_amount_usd: number;
+  /** Deuda/saldo inicial del período (deuda-inicial); se suma al total al recalcular desde líneas. */
+  opening_carry_amount: number;
+  opening_carry_amount_usd: number;
   status: 'abierto' | 'cerrado' | 'pagado' | 'vencido';
+};
+
+export type CardPayableStatementRow = {
+  id: string;
+  card_id: string;
+  period_year: number;
+  period_month: number;
+  due_date: string;
+  minimum_payment: number;
+  outstanding_amount: number;
+  outstanding_amount_usd: number;
+  status: CardStatementRow['status'];
 };
 
 export type CardStatementLineRow = {
   id: string;
-  source_type: 'movement' | 'installment';
+  source_type: 'movement' | 'installment' | 'payment';
   movement_id: string | null;
   installment_id: string | null;
+  payment_id?: string | null;
   detail: string;
   amount: number;
+  currency: 'ARS' | 'USD';
+  fx_ars_per_usd?: number | null;
+  movement_date?: string | null;
   installment_number?: number;
   total_installments?: number;
 };
@@ -98,7 +137,7 @@ export type CardPendingInstallmentRow = {
 
 /** Respuesta de GET /tarjetas/:id/cuotas-pendientes */
 export type CardPendingInstallmentsResult = {
-  /** Cantidad de cuotas con saldo pendiente (filas en la tabla). */
+  /** Máxima cantidad de cuotas pendientes por deuda; las deudas corren en paralelo. */
   pending_count: number;
   /** Suma de saldos restantes de esas cuotas. */
   total_remaining_amount: number;
@@ -115,9 +154,14 @@ export type CardSpendRangeSummary = {
   from: string;
   to: string;
   scope: EntryScope;
+  /** Gastos en ARS (sin convertir USD). */
   total_spent: number;
+  /** Gastos en USD en el rango. */
+  total_spent_usd?: number;
   movements_count: number;
   by_month: CardSpendByMonth[];
+  /** Gastos USD por mes calendario (YYYY-MM). */
+  by_month_usd?: CardSpendByMonth[];
 };
 
 export type CreditCardsTotalDebtSummary = {
@@ -131,6 +175,26 @@ export type SetInitialCardDebtInput = {
   month: number;
   outstanding_amount: number;
   due_date?: string;
+};
+
+export type StatementWindowInput = {
+  opened_at?: string;
+  closed_at?: string;
+  due_date?: string;
+};
+
+export type StatementSyncReport = {
+  added_movements: number;
+  removed_movements: number;
+  added_installments: number;
+  removed_installments: number;
+  previous_total: number;
+  new_total: number;
+};
+
+export type UpdateStatementWindowResult = {
+  statement: CardStatementDetail;
+  sync: StatementSyncReport;
 };
 
 export type CreateTarjetaInput = {
@@ -174,7 +238,18 @@ export interface TarjetaRepositoryPort {
   ): Promise<TarjetaUsageSummary | null>;
   listStatementsByCardId(id: string): Promise<CardStatementRow[] | null>;
   getStatementById(cardId: string, statementId: string): Promise<CardStatementDetail | null>;
-  generateMonthlyStatement(cardId: string, year: number, month: number): Promise<CardStatementDetail | null>;
+  payableStatementByCardId(id: string): Promise<CardPayableStatementRow | null>;
+  generateMonthlyStatement(
+    cardId: string,
+    year: number,
+    month: number,
+    windowOverride?: StatementWindowInput,
+  ): Promise<CardStatementDetail | null>;
+  updateStatementWindow(
+    cardId: string,
+    statementId: string,
+    input: StatementWindowInput,
+  ): Promise<UpdateStatementWindowResult | null>;
   spendByRange(
     cardId: string,
     from: string,

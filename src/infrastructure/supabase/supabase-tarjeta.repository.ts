@@ -3,6 +3,7 @@ import { REQUEST } from '@nestjs/core';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
   CreditCardsTotalDebtSummary,
+  CardPayableStatementRow,
   CardStatementDetail,
   CardStatementLineRow,
   CardStatementRow,
@@ -11,11 +12,14 @@ import {
   CardSpendRangeSummary,
   CreateTarjetaInput,
   SetInitialCardDebtInput,
+  StatementSyncReport,
+  StatementWindowInput,
   TarjetaDebtInstallmentRow,
   TarjetaDebtRow,
   TarjetaRepositoryPort,
   TarjetaRow,
   TarjetaUsageSummary,
+  UpdateStatementWindowResult,
   UpdateTarjetaInput,
   defaultCardName,
   isTypeCard,
@@ -23,6 +27,42 @@ import {
 import type { EntryScope } from '../../domain/ports/entry-mode.port';
 import type { AuthenticatedRequest } from '../../auth/auth.types';
 import { getAuthenticatedUserId } from '../../auth/request-user.util';
+import {
+  signedStatementLineAmountForTotals,
+  statementLineTreatsMovementAsCredit,
+  type StatementLineMovementMeta,
+} from './statement-line-credit.util';
+
+type MoneyBucket = { ars: number; usd: number };
+
+function emptyBucket(): MoneyBucket {
+  return { ars: 0, usd: 0 };
+}
+
+export function normalizeMovementCurrency(c: string | null | undefined): 'ARS' | 'USD' {
+  const u = String(c ?? 'ARS').trim().toUpperCase();
+  return u === 'USD' ? 'USD' : 'ARS';
+}
+
+/** Campos de `card_statements` para lectura consistente (ARS + USD). */
+const CARD_STATEMENT_SELECT_FIELDS =
+  'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, total_amount_usd, paid_amount, paid_amount_usd, outstanding_amount, outstanding_amount_usd, opening_carry_amount, opening_carry_amount_usd, status';
+
+export function movementLinePayload(row: {
+  amount: number | string;
+  currency?: string | null;
+  fx_ars_per_usd?: number | string | null;
+}): { amount: number; currency: 'ARS' | 'USD'; fx_ars_per_usd: number | null } {
+  const n = Number(row.amount);
+  const currency = normalizeMovementCurrency(row.currency);
+  const fxRaw = row.fx_ars_per_usd;
+  const fxNum = fxRaw === null || fxRaw === undefined || fxRaw === '' ? NaN : Number(fxRaw);
+  return {
+    amount: Number.isFinite(n) ? n : 0,
+    currency,
+    fx_ars_per_usd: Number.isFinite(fxNum) ? fxNum : null,
+  };
+}
 
 @Injectable({ scope: Scope.REQUEST })
 export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
@@ -172,76 +212,382 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     scope: EntryScope = 'operativo',
   ): Promise<TarjetaUsageSummary | null> {
     const card = await this.findById(id);
-    if (!card) return null;
+    if (!card) {
+      return null;
+    }
 
     const current = monthRange(today, 0);
     const next = monthRange(today, 1);
 
-    const [spentCurrent, spentNext, statementDebt, cycleWindows] = await Promise.all([
-      this.sumCardSpendByPeriod(id, current.from, current.to, scope),
-      this.sumCardSpendByPeriod(id, next.from, next.to, scope),
-      this.getStatementDebtDueUntil(id, current.to),
-      this.resolveCycleWindows(card, today),
+    if (card.type_card !== 'credito') {
+      const [spentCurrent, spentNext, cycleWindows] = await Promise.all([
+        this.sumCardSpendByPeriodBuckets(id, current.from, current.to, scope),
+        this.sumCardSpendByPeriodBuckets(id, next.from, next.to, scope),
+        this.resolveCycleWindows(card, today),
+      ]);
+      const creditLimit = card.credit_limit;
+      return {
+        card_id: card.id,
+        month_current: current.label,
+        month_next: next.label,
+        spent_current: spentCurrent.ars,
+        spent_next: spentNext.ars,
+        spent_current_usd: spentCurrent.usd,
+        spent_next_usd: spentNext.usd,
+        pending_month_debt: 0,
+        pending_month_credit: 0,
+        next_month_debt: 0,
+        credit_limit: creditLimit,
+        available_current: creditLimit === null ? null : round2(creditLimit - spentCurrent.ars),
+        available_next: creditLimit === null ? null : round2(creditLimit - spentNext.ars),
+        current_cycle: cycleWindows.current,
+        next_cycle: cycleWindows.next,
+      };
+    }
+
+    await this.ensureDueStatementsForCalendarMonth(id, card, current.from, current.to, today);
+
+    const [spentCurrent, spentNext, cycleWindows, pendingBucket, unallocatedBucket] =
+      await Promise.all([
+        this.sumCardSpendByPeriodBuckets(id, current.from, current.to, scope),
+        this.sumCardSpendByPeriodBuckets(id, next.from, next.to, scope),
+        this.resolveCycleWindows(card, today),
+        this.sumOutstandingStatementsDueBuckets(id, current.to),
+        this.sumUnallocatedCreditsByCurrency(id),
+      ]);
+
+    const closingIso = cycleWindows.current.to;
+    const billingYear = Number(closingIso.slice(0, 4));
+    const billingMonth = Number(closingIso.slice(5, 7));
+    const [currentCycleSinglePay, currentCycleInstallments] = await Promise.all([
+      this.sumCardSinglePaySpendByPeriodBuckets(id, cycleWindows.current.from, cycleWindows.current.to, scope),
+      this.sumCardInstallmentsForBillingPeriodBuckets(id, billingYear, billingMonth, scope),
     ]);
+    const nextMonthDebt = round2(currentCycleSinglePay.ars + currentCycleInstallments.ars);
+    const nextMonthDebtUsd = round2(currentCycleSinglePay.usd + currentCycleInstallments.usd);
 
     const creditLimit = card.credit_limit;
-    // "Deuda próximo mes" debe incluir lo consumido en el ciclo vigente
-    // (hasta el cierre inclusive), no el ciclo siguiente.
-    const [
-      spentUntilCurrentClosing,
-      spentUntilNextClosing,
-      paidUntilCurrentClosing,
-      previousCycleDebt,
-      previousCycleDebtProbe,
-    ] = await Promise.all([
-      this.sumCardProjectedDebtByPeriod(id, cycleWindows.current.from, cycleWindows.current.to, scope),
-      this.sumCardProjectedDebtByPeriod(id, cycleWindows.next.from, cycleWindows.next.to, scope),
-      this.sumCardPaymentsByPeriod(id, cycleWindows.current.from, cycleWindows.current.to, scope),
-      !statementDebt.hasDueStatements && cycleWindows.previous ?
-        this.sumCardProjectedDebtByPeriod(id, cycleWindows.previous.from, cycleWindows.previous.to, scope)
-      : Promise.resolve(0),
-      cycleWindows.previous ?
-        this.sumCardProjectedDebtByPeriod(id, cycleWindows.previous.from, cycleWindows.previous.to, scope)
-      : Promise.resolve(0),
-    ]);
-    const carryOverBase =
-      statementDebt.hasDueStatements ?
-        statementDebt.outstandingAmount
-      : previousCycleDebt;
-    const cycleOpen = isCycleOpenForReference(today, card.closing_day);
-    const debtBuckets = computeDebtBuckets({
-      carryOverBase,
-      paidUntilCurrentClosing,
-      spentUntilCurrentClosing,
-      spentUntilNextClosing,
-      cycleOpen,
-    });
-
     return {
       card_id: card.id,
       month_current: current.label,
       month_next: next.label,
-      spent_current: spentCurrent,
-      spent_next: spentNext,
-      pending_month_debt: debtBuckets.pendingMonthDebt,
-      pending_month_credit: debtBuckets.pendingMonthCredit,
-      next_month_debt: debtBuckets.nextMonthDebt,
+      spent_current: spentCurrent.ars,
+      spent_next: spentNext.ars,
+      spent_current_usd: spentCurrent.usd,
+      spent_next_usd: spentNext.usd,
+      pending_month_debt: pendingBucket.ars,
+      pending_month_debt_usd: pendingBucket.usd,
+      pending_month_credit: unallocatedBucket.ars,
+      pending_month_credit_usd: unallocatedBucket.usd,
+      next_month_debt: nextMonthDebt,
+      next_month_debt_usd: nextMonthDebtUsd,
       credit_limit: creditLimit,
-      available_current: creditLimit === null ? null : round2(creditLimit - spentCurrent),
-      available_next: creditLimit === null ? null : round2(creditLimit - spentNext),
+      available_current: creditLimit === null ? null : round2(creditLimit - spentCurrent.ars),
+      available_next: creditLimit === null ? null : round2(creditLimit - spentNext.ars),
+      current_cycle: cycleWindows.current,
+      next_cycle: cycleWindows.next,
     };
+  }
+
+  private async ensureDueStatementsForCalendarMonth(
+    cardId: string,
+    card: TarjetaRow,
+    dueFrom: string,
+    dueTo: string,
+    today: Date,
+  ): Promise<void> {
+    const cy = today.getUTCFullYear();
+    const cm = today.getUTCMonth() + 1;
+    const keys = collectPeriodKeysWithDueInCalendarMonth(card, dueFrom, dueTo, cy, cm);
+    for (const { year, month } of keys) {
+      const { data: existing, error } = await this.client
+        .from('card_statements')
+        .select('id')
+        .eq('user_id', this.userId)
+        .eq('card_id', cardId)
+        .eq('period_year', year)
+        .eq('period_month', month)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      if (existing) continue;
+      await this.generateMonthlyStatement(cardId, year, month);
+    }
+  }
+
+  private async sumOutstandingStatementsDueBuckets(
+    cardId: string,
+    toDue: string,
+  ): Promise<MoneyBucket> {
+    const { data, error } = await this.client
+      .from('card_statements')
+      .select('outstanding_amount, outstanding_amount_usd')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .lte('due_date', toDue);
+    if (error) throw new Error(error.message);
+    let ars = 0;
+    let usd = 0;
+    for (const row of data ?? []) {
+      const r = row as { outstanding_amount: number | string; outstanding_amount_usd?: number | string };
+      const a = Number(r.outstanding_amount);
+      const u = Number(r.outstanding_amount_usd ?? 0);
+      if (Number.isFinite(a)) ars += Math.max(a, 0);
+      if (Number.isFinite(u)) usd += Math.max(u, 0);
+    }
+    return { ars: round2(ars), usd: round2(usd) };
+  }
+
+  private async sumUnallocatedCreditsByCurrency(cardId: string): Promise<MoneyBucket> {
+    const { data: payments, error: pErr } = await this.client
+      .from('card_statement_payments')
+      .select('id, amount, currency')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId);
+    if (pErr) throw new Error(pErr.message);
+    const ids = (payments ?? []).map((p: { id: string }) => p.id);
+    if (ids.length === 0) return emptyBucket();
+
+    const { data: allocs, error: aErr } = await this.client
+      .from('card_statement_payment_allocations')
+      .select('payment_id, applied_amount')
+      .in('payment_id', ids);
+    if (aErr) throw new Error(aErr.message);
+
+    const allocatedByPayment = new Map<string, number>();
+    for (const row of allocs ?? []) {
+      const r = row as { payment_id: string; applied_amount: number | string };
+      const amt = Number(r.applied_amount);
+      if (!Number.isFinite(amt)) continue;
+      allocatedByPayment.set(r.payment_id, (allocatedByPayment.get(r.payment_id) ?? 0) + amt);
+    }
+
+    let ars = 0;
+    let usd = 0;
+    for (const p of payments ?? []) {
+      const row = p as { id: string; amount: number | string; currency?: string | null };
+      const paid = Number(row.amount);
+      const allocated = round2(allocatedByPayment.get(row.id) ?? 0);
+      if (!Number.isFinite(paid)) continue;
+      const rem = Math.max(round2(paid - allocated), 0);
+      if (rem <= 0) continue;
+      if (normalizeMovementCurrency(row.currency) === 'USD') usd += rem;
+      else ars += rem;
+    }
+    return { ars: round2(ars), usd: round2(usd) };
+  }
+
+  private async applyUnallocatedForOneCurrency(
+    cardId: string,
+    statementId: string,
+    currency: 'ARS' | 'USD',
+    totalForCurrency: number,
+  ): Promise<void> {
+    const { data: existingAllocs, error: e0 } = await this.client
+      .from('card_statement_payment_allocations')
+      .select('applied_amount, currency')
+      .eq('statement_id', statementId);
+    if (e0) throw new Error(e0.message);
+    let paidSoFar = round2(
+      (existingAllocs ?? []).reduce((acc, r: { applied_amount: number | string; currency?: string | null }) => {
+        if (normalizeMovementCurrency(r.currency) !== currency) return acc;
+        const n = Number(r.applied_amount);
+        return Number.isFinite(n) ? acc + n : acc;
+      }, 0),
+    );
+    let outstanding = round2(Math.max(totalForCurrency - paidSoFar, 0));
+    if (outstanding <= 0) return;
+
+    const { data: payments, error } = await this.client
+      .from('card_statement_payments')
+      .select('id, amount, payment_date, created_at, currency')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .eq('currency', currency)
+      .order('payment_date', { ascending: true })
+      .order('created_at', { ascending: true });
+    if (error) throw new Error(error.message);
+
+    const paymentIds = (payments ?? []).map((p: { id: string }) => p.id);
+    if (paymentIds.length === 0) return;
+
+    const { data: allAllocs, error: e2 } = await this.client
+      .from('card_statement_payment_allocations')
+      .select('payment_id, applied_amount')
+      .in('payment_id', paymentIds);
+    if (e2) throw new Error(e2.message);
+
+    const allocatedByPayment = new Map<string, number>();
+    for (const row of allAllocs ?? []) {
+      const r = row as { payment_id: string; applied_amount: number | string };
+      const amt = Number(r.applied_amount);
+      if (!Number.isFinite(amt)) continue;
+      allocatedByPayment.set(r.payment_id, (allocatedByPayment.get(r.payment_id) ?? 0) + amt);
+    }
+
+    for (const p of payments ?? []) {
+      if (outstanding <= 0) break;
+      const row = p as { id: string; amount: number | string };
+      const paymentAmount = Number(row.amount);
+      const allocated = round2(allocatedByPayment.get(row.id) ?? 0);
+      if (!Number.isFinite(paymentAmount)) continue;
+      const remainder = round2(Math.max(paymentAmount - allocated, 0));
+      if (remainder <= 0) continue;
+      const applyAmt = round2(Math.min(remainder, outstanding));
+      if (applyAmt <= 0) continue;
+
+      const { error: insErr } = await this.client.from('card_statement_payment_allocations').insert({
+        payment_id: row.id,
+        statement_id: statementId,
+        applied_amount: applyAmt,
+        currency,
+      });
+      if (insErr) throw new Error(insErr.message);
+
+      allocatedByPayment.set(row.id, round2((allocatedByPayment.get(row.id) ?? 0) + applyAmt));
+      paidSoFar = round2(paidSoFar + applyAmt);
+      outstanding = round2(Math.max(totalForCurrency - paidSoFar, 0));
+    }
+  }
+
+  private async applyUnallocatedCreditToStatement(
+    cardId: string,
+    statementId: string,
+    totalArs: number,
+    totalUsd: number,
+  ): Promise<void> {
+    await this.applyUnallocatedForOneCurrency(cardId, statementId, 'ARS', totalArs);
+    await this.applyUnallocatedForOneCurrency(cardId, statementId, 'USD', totalUsd);
+  }
+
+  private async getStatementOpeningCarryBuckets(statementId: string): Promise<{ ars: number; usd: number }> {
+    const { data, error } = await this.client
+      .from('card_statements')
+      .select('opening_carry_amount, opening_carry_amount_usd')
+      .eq('id', statementId)
+      .eq('user_id', this.userId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    const row = data as { opening_carry_amount?: unknown; opening_carry_amount_usd?: unknown } | null;
+    const ars = Number(row?.opening_carry_amount ?? 0);
+    const usd = Number(row?.opening_carry_amount_usd ?? 0);
+    const out = {
+      ars: round2(Number.isFinite(ars) ? ars : 0),
+      usd: round2(Number.isFinite(usd) ? usd : 0),
+    };
+    return out;
+  }
+
+  private async syncStatementTotalsFromLinesAndAllocations(
+    statementId: string,
+    statusWhenOutstanding: 'cerrado' | 'vencido' | 'abierto' = 'cerrado',
+  ): Promise<void> {
+    const { data: lines, error: le } = await this.client
+      .from('card_statement_lines')
+      .select('amount, currency, movement_id, detail')
+      .eq('statement_id', statementId);
+    if (le) throw new Error(le.message);
+
+    const movementIds = Array.from(
+      new Set(
+        (lines ?? [])
+          .map((r: { movement_id?: string | null }) => r.movement_id ?? null)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0),
+      ),
+    );
+    const movementMetaById = new Map<string, StatementLineMovementMeta>();
+    if (movementIds.length > 0) {
+      const { data: movementRows, error: movementErr } = await this.client
+        .from('movements')
+        .select('id, direction, raw_message')
+        .eq('user_id', this.userId)
+        .in('id', movementIds);
+      if (movementErr) throw new Error(movementErr.message);
+      for (const row of (movementRows ?? []) as Array<{
+        id: string;
+        direction?: string | null;
+        raw_message?: string | null;
+      }>) {
+        movementMetaById.set(row.id, {
+          direction: String(row.direction ?? 'gasto'),
+          raw_message: typeof row.raw_message === 'string' ? row.raw_message : null,
+        });
+      }
+    }
+
+    let totalArs = 0;
+    let totalUsd = 0;
+    for (const row of lines ?? []) {
+      const r = row as {
+        amount: number | string;
+        currency?: string | null;
+        movement_id?: string | null;
+        detail?: string | null;
+      };
+      const signedAmt = signedStatementLineAmountForTotals(r, movementMetaById);
+      if (signedAmt === null) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') totalUsd += signedAmt;
+      else totalArs += signedAmt;
+    }
+    totalArs = round2(totalArs);
+    totalUsd = round2(totalUsd);
+    const carryBuckets = await this.getStatementOpeningCarryBuckets(statementId);
+    totalArs = round2(totalArs + carryBuckets.ars);
+    totalUsd = round2(totalUsd + carryBuckets.usd);
+
+    const { data: allocs, error: ae } = await this.client
+      .from('card_statement_payment_allocations')
+      .select('applied_amount, currency')
+      .eq('statement_id', statementId);
+    if (ae) throw new Error(ae.message);
+
+    let paidArs = 0;
+    let paidUsd = 0;
+    for (const row of allocs ?? []) {
+      const r = row as { applied_amount: number | string; currency?: string | null };
+      const amt = Number(r.applied_amount);
+      if (!Number.isFinite(amt)) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') paidUsd += amt;
+      else paidArs += amt;
+    }
+    paidArs = round2(paidArs);
+    paidUsd = round2(paidUsd);
+
+    const outstandingArs = round2(Math.max(totalArs - paidArs, 0));
+    const outstandingUsd = round2(Math.max(totalUsd - paidUsd, 0));
+    const fullyPaid = outstandingArs <= 0 && outstandingUsd <= 0;
+    const status =
+      fullyPaid ? 'pagado'
+      : statusWhenOutstanding === 'vencido' ? 'vencido'
+      : statusWhenOutstanding === 'abierto' ? 'abierto'
+      : 'cerrado';
+
+    const { error: upErr } = await this.client
+      .from('card_statements')
+      .update({
+        total_amount: totalArs,
+        total_amount_usd: totalUsd,
+        paid_amount: paidArs,
+        paid_amount_usd: paidUsd,
+        outstanding_amount: outstandingArs,
+        outstanding_amount_usd: outstandingUsd,
+        status,
+      })
+      .eq('id', statementId)
+      .eq('user_id', this.userId);
+    if (upErr) throw new Error(upErr.message);
   }
 
   async generateMonthlyStatement(
     cardId: string,
     year: number,
     month: number,
+    windowOverride?: StatementWindowInput,
   ): Promise<CardStatementDetail | null> {
     const card = await this.findById(cardId);
     if (!card) return null;
     if (month < 1 || month > 12) throw new Error('month debe estar entre 1 y 12');
 
-    const period = monthRangeByYearMonth(year, month, card.due_day ?? 10);
+    const period = resolveStatementPeriodForGenerate(card, year, month, windowOverride);
 
     let statement = await this.findOrCreateStatement(
       cardId,
@@ -254,54 +600,123 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
 
     const { data: movements, error: movementsError } = await this.client
       .from('movements')
-      .select('id, detail, amount, currency, fx_ars_per_usd')
+      .select('id, detail, amount, currency, fx_ars_per_usd, installments_total, direction, movement_date, entry_mode')
       .eq('user_id', this.userId)
       .eq('status', 'active')
       .eq('card_id', cardId)
-      .eq('direction', 'gasto')
       .eq('payment_method', 'tarjeta')
       .eq('entry_mode', 'operativo')
+      .or('direction.eq.gasto,and(direction.eq.ingreso,settled_card_id.is.null)')
+      .or('installments_total.is.null,installments_total.lte.1')
       .gte('movement_date', period.from)
       .lte('movement_date', period.to);
     if (movementsError) throw new Error(movementsError.message);
+    const movementRows = (movements ?? []) as Array<{
+      id: string;
+      detail: string | null;
+      movement_date?: string | null;
+      entry_mode?: string | null;
+      installments_total?: number | null;
+      direction?: string | null;
+    }>;
 
-    for (const movement of (movements ?? []) as Array<{
+    for (const movement of movementRows as Array<{
       id: string;
       detail: string;
       amount: number | string;
       currency?: string | null;
       fx_ars_per_usd?: number | string | null;
+      movement_date?: string | null;
+      direction?: string | null;
     }>) {
       const { data: existingLine, error: existingLineError } = await this.client
         .from('card_statement_lines')
-        .select('id')
+        .select('id, statement_id')
         .eq('movement_id', movement.id)
         .maybeSingle();
       if (existingLineError) throw new Error(existingLineError.message);
       if (existingLine) continue;
 
+      const linePayload = movementLinePayload(movement);
       const { error: lineError } = await this.client.from('card_statement_lines').insert({
         statement_id: statement.id,
         source_type: 'movement',
         movement_id: movement.id,
         installment_id: null,
         detail: movement.detail || 'Consumo tarjeta',
-        amount: effectiveMovementArsAmount(movement),
+        amount: linePayload.amount,
+        currency: linePayload.currency,
+        fx_ars_per_usd: linePayload.fx_ars_per_usd,
       });
       if (lineError) throw new Error(lineError.message);
     }
 
-    const { data: installments, error: installmentsError } = await this.client
+    const installmentSelect =
+      'id, debt_id, installment_number, amount, due_date, statement_id, billing_period_year, billing_period_month, card_installment_debts!inner(description, card_id, user_id, currency)';
+
+    const { data: installmentsByDue, error: instDueErr } = await this.client
       .from('card_debt_installments')
-      .select(
-        'id, debt_id, installment_number, amount, due_date, statement_id, card_installment_debts!inner(description, card_id, user_id)',
-      )
+      .select(installmentSelect)
       .is('statement_id', null)
+      .neq('status', 'pagada')
       .gte('due_date', period.from)
       .lte('due_date', period.to);
-    if (installmentsError) throw new Error(installmentsError.message);
+    if (instDueErr) throw new Error(instDueErr.message);
 
-    for (const installment of (installments ?? []) as Array<{
+    const { data: installmentsByBilling, error: instBillErr } = await this.client
+      .from('card_debt_installments')
+      .select(installmentSelect)
+      .is('statement_id', null)
+      .neq('status', 'pagada')
+      .eq('billing_period_year', year)
+      .eq('billing_period_month', month);
+    if (instBillErr) throw new Error(instBillErr.message);
+
+    const bridgeDueUpper = addMonthsIso(period.due, 1);
+    const { data: installmentsBridge, error: instBridgeErr } = await this.client
+      .from('card_debt_installments')
+      .select(installmentSelect)
+      .is('statement_id', null)
+      .neq('status', 'pagada')
+      .gt('due_date', period.to)
+      .lte('due_date', bridgeDueUpper);
+    if (instBridgeErr) throw new Error(instBridgeErr.message);
+
+    const installmentById = new Map<
+      string,
+      {
+        id: string;
+        debt_id: string;
+        installment_number: number;
+        amount: number | string;
+        due_date: string;
+        statement_id: string | null;
+        card_installment_debts:
+          | { description: string; card_id: string; user_id: string; currency?: string | null }
+          | Array<{ description: string; card_id: string; user_id: string; currency?: string | null }>;
+      }
+    >();
+    for (const row of [
+      ...(installmentsByDue ?? []),
+      ...(installmentsByBilling ?? []),
+      ...(installmentsBridge ?? []),
+    ]) {
+      const r = row as {
+        id: string;
+        debt_id: string;
+        installment_number: number;
+        amount: number | string;
+        due_date: string;
+        statement_id: string | null;
+        card_installment_debts:
+          | { description: string; card_id: string; user_id: string; currency?: string | null }
+          | Array<{ description: string; card_id: string; user_id: string; currency?: string | null }>;
+      };
+      installmentById.set(r.id, r);
+    }
+    const installments = [...installmentById.values()];
+
+    for (const installment of installments as Array<{
       id: string;
       debt_id: string;
       installment_number: number;
@@ -309,8 +724,8 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       due_date: string;
       statement_id: string | null;
       card_installment_debts:
-        | { description: string; card_id: string; user_id: string }
-        | Array<{ description: string; card_id: string; user_id: string }>;
+        | { description: string; card_id: string; user_id: string; currency?: string | null }
+        | Array<{ description: string; card_id: string; user_id: string; currency?: string | null }>;
     }>) {
       const debtRef =
         Array.isArray(installment.card_installment_debts) ?
@@ -320,6 +735,16 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       if (debtRef.user_id !== this.userId) continue;
       if (debtRef.card_id !== cardId) continue;
 
+      const { data: existingInstLine, error: existingInstLineErr } = await this.client
+        .from('card_statement_lines')
+        .select('id')
+        .eq('statement_id', statement.id)
+        .eq('installment_id', installment.id)
+        .maybeSingle();
+      if (existingInstLineErr) throw new Error(existingInstLineErr.message);
+      if (existingInstLine) continue;
+
+      const instCurrency = normalizeMovementCurrency(debtRef.currency);
       const { error: lineError } = await this.client.from('card_statement_lines').insert({
         statement_id: statement.id,
         source_type: 'installment',
@@ -327,6 +752,8 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
         installment_id: installment.id,
         detail: `${debtRef.description} - cuota ${installment.installment_number}`,
         amount: Number(installment.amount),
+        currency: instCurrency,
+        fx_ars_per_usd: null,
       });
       if (lineError) throw new Error(lineError.message);
 
@@ -339,30 +766,65 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
 
     const { data: lines, error: linesError } = await this.client
       .from('card_statement_lines')
-      .select('amount')
+      .select('amount, currency, movement_id, detail')
       .eq('statement_id', statement.id);
     if (linesError) throw new Error(linesError.message);
 
-    const totalAmount = round2(
-      (lines ?? []).reduce((acc, row: { amount: number | string }) => acc + Number(row.amount), 0),
+    const movementIds = Array.from(
+      new Set(
+        (lines ?? [])
+          .map((r: { movement_id?: string | null }) => r.movement_id ?? null)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0),
+      ),
     );
+    const movementMetaById = new Map<string, StatementLineMovementMeta>();
+    if (movementIds.length > 0) {
+      const { data: movementRows, error: movementErr } = await this.client
+        .from('movements')
+        .select('id, direction, raw_message')
+        .eq('user_id', this.userId)
+        .in('id', movementIds);
+      if (movementErr) throw new Error(movementErr.message);
+      for (const row of (movementRows ?? []) as Array<{
+        id: string;
+        direction?: string | null;
+        raw_message?: string | null;
+      }>) {
+        movementMetaById.set(row.id, {
+          direction: String(row.direction ?? 'gasto'),
+          raw_message: typeof row.raw_message === 'string' ? row.raw_message : null,
+        });
+      }
+    }
 
-    const paidAmount = statement.paid_amount;
-    const outstandingAmount = round2(Math.max(totalAmount - paidAmount, 0));
-    const status = outstandingAmount === 0 ? 'pagado' : 'cerrado';
+    let totalArs = 0;
+    let totalUsd = 0;
+    for (const row of lines ?? []) {
+      const r = row as {
+        amount: number | string;
+        currency?: string | null;
+        movement_id?: string | null;
+        detail?: string | null;
+      };
+      const signedAmt = signedStatementLineAmountForTotals(r, movementMetaById);
+      if (signedAmt === null) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') totalUsd += signedAmt;
+      else totalArs += signedAmt;
+    }
+    totalArs = round2(totalArs);
+    totalUsd = round2(totalUsd);
+    const carryForStatement = await this.getStatementOpeningCarryBuckets(statement.id);
+    totalArs = round2(totalArs + carryForStatement.ars);
+    totalUsd = round2(totalUsd + carryForStatement.usd);
+
+    await this.applyUnallocatedCreditToStatement(cardId, statement.id, totalArs, totalUsd);
+    await this.syncStatementTotalsFromLinesAndAllocations(statement.id);
 
     const { data: updated, error: updateStatementError } = await this.client
       .from('card_statements')
-      .update({
-        total_amount: totalAmount,
-        outstanding_amount: outstandingAmount,
-        status,
-      })
+      .select(CARD_STATEMENT_SELECT_FIELDS)
       .eq('id', statement.id)
       .eq('user_id', this.userId)
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
       .single();
     if (updateStatementError) throw new Error(updateStatementError.message);
 
@@ -378,9 +840,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
 
     const { data, error } = await this.client
       .from('card_statements')
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
+      .select(CARD_STATEMENT_SELECT_FIELDS)
       .eq('user_id', this.userId)
       .eq('card_id', id)
       .order('period_year', { ascending: false })
@@ -388,6 +848,36 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     if (error) throw new Error(error.message);
 
     return (data ?? []).map(mapStatementRow);
+  }
+
+  async payableStatementByCardId(id: string): Promise<CardPayableStatementRow | null> {
+    const card = await this.findById(id);
+    if (!card) return null;
+
+    const selectFields =
+      'id, card_id, period_year, period_month, due_date, minimum_payment, outstanding_amount, outstanding_amount_usd, status';
+    const findWithStatuses = async (
+      statuses: Array<CardStatementRow['status']>,
+      ascendingDueDate: boolean,
+    ): Promise<CardPayableStatementRow | null> => {
+      const { data, error } = await this.client
+        .from('card_statements')
+        .select(selectFields)
+        .eq('user_id', this.userId)
+        .eq('card_id', id)
+        .in('status', statuses)
+        .or('outstanding_amount.gt.0,outstanding_amount_usd.gt.0')
+        .order('due_date', { ascending: ascendingDueDate })
+        .limit(1);
+      if (error) throw new Error(error.message);
+      const row = (data ?? [])[0];
+      return row ? mapPayableStatementRow(row) : null;
+    };
+
+    return (
+      (await findWithStatuses(['cerrado', 'vencido'], true)) ??
+      (await findWithStatuses(['abierto', 'cerrado', 'vencido'], false))
+    );
   }
 
   async spendByRange(
@@ -424,22 +914,32 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const { data, error } = await query;
     if (error) throw new Error(error.message);
 
-    const byMonthMap = new Map<string, number>();
-    let total = 0;
+    const byMonthArs = new Map<string, number>();
+    const byMonthUsd = new Map<string, number>();
+    let totalArs = 0;
+    let totalUsd = 0;
     for (const row of (data ?? []) as Array<{
       amount: number | string;
       currency?: string | null;
       fx_ars_per_usd?: number | string | null;
       movement_date: string;
     }>) {
-      const amount = effectiveMovementArsAmount(row);
-      if (!Number.isFinite(amount)) continue;
-      total += amount;
+      const n = Number(row.amount);
+      if (!Number.isFinite(n)) continue;
       const month = String(row.movement_date).slice(0, 7);
-      byMonthMap.set(month, round2((byMonthMap.get(month) ?? 0) + amount));
+      if (normalizeMovementCurrency(row.currency) === 'USD') {
+        totalUsd += n;
+        byMonthUsd.set(month, round2((byMonthUsd.get(month) ?? 0) + n));
+      } else {
+        totalArs += n;
+        byMonthArs.set(month, round2((byMonthArs.get(month) ?? 0) + n));
+      }
     }
 
-    const by_month = Array.from(byMonthMap.entries())
+    const by_month = Array.from(byMonthArs.entries())
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([month, amount]) => ({ month, amount }));
+    const by_month_usd = Array.from(byMonthUsd.entries())
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([month, amount]) => ({ month, amount }));
 
@@ -448,9 +948,11 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       from,
       to,
       scope,
-      total_spent: round2(total),
+      total_spent: round2(totalArs),
+      total_spent_usd: round2(totalUsd),
       movements_count: (data ?? []).length,
       by_month,
+      by_month_usd,
     };
   }
 
@@ -463,28 +965,19 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const { data, error } = await this.client
       .from('card_debt_installments')
       .select(
-        'id, debt_id, installment_number, due_date, amount, paid_amount, status, card_installment_debts!inner(description, card_id, user_id, status, total_installments)',
+        'id, debt_id, installment_number, due_date, amount, paid_amount, status, card_installment_debts!inner(description, card_id, user_id, status, total_installments, source_movement_id)',
       )
       .neq('status', 'pagada')
       .eq('card_installment_debts.card_id', id)
       .eq('card_installment_debts.user_id', this.userId)
       .order('due_date', { ascending: true })
       .order('installment_number', { ascending: true });
-    console.log('[tarjetas.repo cuotas-pendientes] supabase raw', {
-      card_id: id,
-      error: error?.message ?? null,
-      data_type: data === null ? 'null' : Array.isArray(data) ? 'array' : typeof data,
-    });
     if (error) throw new Error(error.message);
 
     const rowsRaw = data ?? [];
     const rowsList = Array.isArray(rowsRaw) ? rowsRaw : [];
-    if (!Array.isArray(rowsRaw)) {
-      console.log('[tarjetas.repo cuotas-pendientes] data no es array; se usa []', rowsRaw);
-    }
 
-    const installments: CardPendingInstallmentRow[] = [];
-    for (const row of rowsList as Array<{
+    const parsedRows = rowsList as Array<{
       id: string;
       debt_id: string;
       installment_number: number;
@@ -499,6 +992,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
             user_id: string;
             status: string;
             total_installments: number;
+            source_movement_id?: string | null;
           }
         | Array<{
             description: string;
@@ -506,8 +1000,38 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
             user_id: string;
             status: string;
             total_installments: number;
+            source_movement_id?: string | null;
           }>;
-    }>) {
+    }>;
+
+    const sourceMovementIds = new Set<string>();
+    for (const row of parsedRows) {
+      const dr =
+        Array.isArray(row.card_installment_debts) ?
+          row.card_installment_debts[0]
+        : row.card_installment_debts;
+      const sid = dr?.source_movement_id;
+      if (typeof sid === 'string' && sid.trim().length > 0) {
+        sourceMovementIds.add(sid.trim());
+      }
+    }
+
+    let activeSourceMovementIds = new Set<string>();
+    if (sourceMovementIds.size > 0) {
+      const { data: activeRows, error: activeErr } = await this.client
+        .from('movements')
+        .select('id')
+        .eq('user_id', this.userId)
+        .eq('status', 'active')
+        .in('id', Array.from(sourceMovementIds));
+      if (activeErr) throw new Error(activeErr.message);
+      activeSourceMovementIds = new Set(
+        (activeRows ?? []).map((r: { id: string }) => r.id),
+      );
+    }
+
+    const installments: CardPendingInstallmentRow[] = [];
+    for (const row of parsedRows) {
       const debtRef =
         Array.isArray(row.card_installment_debts) ?
           row.card_installment_debts[0]
@@ -516,6 +1040,13 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       if (debtRef.user_id !== this.userId) continue;
       if (debtRef.card_id !== id) continue;
       if (debtRef.status === 'pagada' || debtRef.status === 'cancelada') continue;
+      const srcId =
+        typeof debtRef.source_movement_id === 'string' ?
+          debtRef.source_movement_id.trim()
+        : '';
+      if (srcId.length > 0 && !activeSourceMovementIds.has(srcId)) {
+        continue;
+      }
 
       const amount = Number(row.amount);
       const paidAmount = Number(row.paid_amount);
@@ -549,7 +1080,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       installments.reduce((s, r) => s + r.remaining_amount, 0),
     );
     return {
-      pending_count: installments.length,
+      pending_count: maxPendingInstallmentCountByDebt(installments),
       total_remaining_amount,
       installments,
     };
@@ -561,9 +1092,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
 
     const { data: statement, error: statementError } = await this.client
       .from('card_statements')
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
+      .select(CARD_STATEMENT_SELECT_FIELDS)
       .eq('id', statementId)
       .eq('user_id', this.userId)
       .eq('card_id', cardId)
@@ -573,7 +1102,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
 
     const { data: lines, error: linesError } = await this.client
       .from('card_statement_lines')
-      .select('id, source_type, movement_id, installment_id, detail, amount')
+      .select('id, source_type, movement_id, installment_id, detail, amount, currency, fx_ars_per_usd')
       .eq('statement_id', statementId)
       .order('created_at', { ascending: true });
     if (linesError) throw new Error(linesError.message);
@@ -585,7 +1114,46 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       installment_id: string | null;
       detail: string;
       amount: number | string;
+      currency?: string | null;
+      fx_ars_per_usd?: number | string | null;
     }>;
+    const movementIds = Array.from(
+      new Set(
+        lineRows
+          .map((row) => row.movement_id)
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0),
+      ),
+    );
+    const movementDateById = new Map<string, string | null>();
+    const movementLineMetaById = new Map<string, StatementLineMovementMeta>();
+    if (movementIds.length > 0) {
+      const { data: movementRows, error: movementRowsError } = await this.client
+        .from('movements')
+        .select('id, movement_date, direction, raw_message')
+        .eq('user_id', this.userId)
+        .in('id', movementIds);
+      if (movementRowsError) throw new Error(movementRowsError.message);
+      for (const row of (movementRows ?? []) as Array<{
+        id: string;
+        movement_date?: string | null;
+        direction?: string | null;
+        raw_message?: string | null;
+      }>) {
+        const md =
+          typeof row.movement_date === 'string' && row.movement_date.trim().length > 0 ?
+            row.movement_date
+          : null;
+        movementDateById.set(row.id, md);
+        movementLineMetaById.set(row.id, {
+          direction: String(row.direction ?? 'gasto'),
+          raw_message: typeof row.raw_message === 'string' ? row.raw_message : null,
+        });
+      }
+    }
+    const enrichedLineRows = lineRows.map((row) => ({
+      ...row,
+      movement_date: row.movement_id ? (movementDateById.get(row.movement_id) ?? null) : null,
+    }));
     const installmentIds = Array.from(
       new Set(
         lineRows
@@ -624,14 +1192,79 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       }
     }
 
+    const mappedLines = enrichedLineRows.map((line) =>
+      mapStatementLineRow(
+        line,
+        line.installment_id ? installmentMetaById.get(line.installment_id) : undefined,
+        line.movement_id ? (movementLineMetaById.get(line.movement_id) ?? null) : null,
+      ),
+    );
+
+    const { data: allocations, error: allocationsError } = await this.client
+      .from('card_statement_payment_allocations')
+      .select('id, payment_id, applied_amount, currency, created_at')
+      .eq('statement_id', statementId)
+      .order('created_at', { ascending: true });
+    if (allocationsError) throw new Error(allocationsError.message);
+
+    const allocationRows = (allocations ?? []) as Array<{
+      id: string;
+      payment_id: string;
+      applied_amount: number | string;
+      currency?: string | null;
+      created_at?: string | null;
+    }>;
+    const paymentIds = Array.from(
+      new Set(
+        allocationRows
+          .map((row) => row.payment_id)
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0),
+      ),
+    );
+    const paymentsById = new Map<
+      string,
+      { id: string; movement_id: string | null; payment_date: string | null }
+    >();
+    if (paymentIds.length > 0) {
+      const { data: payments, error: paymentsError } = await this.client
+        .from('card_statement_payments')
+        .select('id, movement_id, payment_date')
+        .eq('user_id', this.userId)
+        .in('id', paymentIds);
+      if (paymentsError) throw new Error(paymentsError.message);
+      for (const row of (payments ?? []) as Array<{
+        id: string;
+        movement_id?: string | null;
+        payment_date?: string | null;
+      }>) {
+        paymentsById.set(row.id, {
+          id: row.id,
+          movement_id: row.movement_id ?? null,
+          payment_date: row.payment_date ?? null,
+        });
+      }
+    }
+
+    const paymentLines: CardStatementLineRow[] = allocationRows.map((row) => {
+      const payment = paymentsById.get(row.payment_id);
+      const amount = Number(row.applied_amount);
+      return {
+        id: row.id,
+        source_type: 'payment',
+        movement_id: payment?.movement_id ?? null,
+        installment_id: null,
+        payment_id: row.payment_id,
+        detail: 'Pago recibido',
+        amount: Number.isFinite(amount) ? -Math.abs(amount) : 0,
+        currency: normalizeMovementCurrency(row.currency),
+        fx_ars_per_usd: null,
+        movement_date: payment?.payment_date ?? null,
+      };
+    });
+
     return {
       ...mapStatementRow(statement),
-      lines: lineRows.map((line) =>
-        mapStatementLineRow(
-          line,
-          line.installment_id ? installmentMetaById.get(line.installment_id) : undefined,
-        ),
-      ),
+      lines: [...mappedLines, ...paymentLines],
     };
   }
 
@@ -658,34 +1291,63 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const rounded = round2(input.outstanding_amount);
     const status = rounded === 0 ? 'pagado' : 'cerrado';
 
-    const { data, error } = await this.client
+    const rowPayload = {
+      opened_at: period.from,
+      closed_at: period.to,
+      due_date: dueDate,
+      total_amount: rounded,
+      total_amount_usd: 0,
+      paid_amount: 0,
+      paid_amount_usd: 0,
+      outstanding_amount: rounded,
+      outstanding_amount_usd: 0,
+      opening_carry_amount: rounded,
+      opening_carry_amount_usd: 0,
+      minimum_payment: 0,
+      interest_amount: 0,
+      status,
+    };
+
+    const { data: existingByPeriod, error: findErr } = await this.client
       .from('card_statements')
-      .upsert(
-        {
+      .select('id')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .eq('period_year', input.year)
+      .eq('period_month', input.month)
+      .maybeSingle();
+    if (findErr) throw new Error(findErr.message);
+
+    let data: Record<string, unknown> | null = null;
+    if (existingByPeriod?.id) {
+      const { data: updated, error: upErr } = await this.client
+        .from('card_statements')
+        .update(rowPayload)
+        .eq('id', existingByPeriod.id)
+        .eq('user_id', this.userId)
+        .select(CARD_STATEMENT_SELECT_FIELDS)
+        .single();
+      if (upErr) throw new Error(upErr.message);
+      data = updated as Record<string, unknown> | null;
+    } else {
+      const { data: inserted, error: insErr } = await this.client
+        .from('card_statements')
+        .insert({
           user_id: this.userId,
           card_id: cardId,
           period_year: input.year,
           period_month: input.month,
-          opened_at: period.from,
-          closed_at: period.to,
-          due_date: dueDate,
-          total_amount: rounded,
-          paid_amount: 0,
-          outstanding_amount: rounded,
-          minimum_payment: 0,
-          interest_amount: 0,
-          status,
-        },
-        { onConflict: 'card_id,period_year,period_month' },
-      )
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
-      .single();
+          ...rowPayload,
+        })
+        .select(CARD_STATEMENT_SELECT_FIELDS)
+        .single();
+      if (insErr) throw new Error(insErr.message);
+      data = inserted as Record<string, unknown> | null;
+    }
 
-    if (error) throw new Error(error.message);
     if (!data) throw new Error('No se pudo guardar deuda inicial de tarjeta');
-    return mapStatementRow(data);
+
+    return mapStatementRow(data as never);
   }
 
   async debtsByCardId(id: string): Promise<TarjetaDebtRow[] | null> {
@@ -788,15 +1450,15 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     };
   }
 
-  private async sumCardSpendByPeriod(
+  private async sumCardSpendByPeriodBuckets(
     cardId: string,
     fromDate: string,
     toDate: string,
     scope: EntryScope,
-  ): Promise<number> {
+  ): Promise<MoneyBucket> {
     let query = this.client
       .from('movements')
-      .select('amount, currency, fx_ars_per_usd')
+      .select('amount, currency')
       .eq('user_id', this.userId)
       .eq('status', 'active')
       .eq('card_id', cardId)
@@ -812,61 +1474,35 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const { data, error } = await query;
 
     if (error) throw new Error(error.message);
-    const total = (data ?? []).reduce(
-      (
-        acc,
-        row: { amount: number | string; currency?: string | null; fx_ars_per_usd?: number | string | null },
-      ) => acc + effectiveMovementArsAmount(row),
-      0,
-    );
-    return round2(total);
-  }
-
-  private async sumCardPaymentsByPeriod(
-    cardId: string,
-    fromDate: string,
-    toDate: string,
-    scope: EntryScope,
-  ): Promise<number> {
-    let query = this.client
-      .from('movements')
-      .select('amount')
-      .eq('user_id', this.userId)
-      .eq('status', 'active')
-      .eq('settled_card_id', cardId)
-      .eq('direction', 'gasto')
-      .gte('movement_date', fromDate)
-      .lte('movement_date', toDate);
-
-    if (scope === 'operativo' || scope === 'historico') {
-      query = query.eq('entry_mode', scope);
+    const bucket = emptyBucket();
+    for (const row of data ?? []) {
+      const r = row as { amount: number | string; currency?: string | null };
+      const n = Number(r.amount);
+      if (!Number.isFinite(n)) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') bucket.usd += n;
+      else bucket.ars += n;
     }
-
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-    const total = (data ?? []).reduce((acc, row: { amount: number | string }) => {
-      const n = Number(row.amount);
-      return Number.isFinite(n) ? acc + n : acc;
-    }, 0);
-    return round2(total);
+    return { ars: round2(bucket.ars), usd: round2(bucket.usd) };
   }
 
-  private async sumCardProjectedDebtByPeriod(
+  /** Gastos en un pago en el período (sin prorratear cuotas): `installments_total` null o 1. */
+  private async sumCardSinglePaySpendByPeriodBuckets(
     cardId: string,
     fromDate: string,
     toDate: string,
     scope: EntryScope,
-  ): Promise<number> {
+  ): Promise<MoneyBucket> {
     let query = this.client
       .from('movements')
-      .select('amount, currency, fx_ars_per_usd, installments_total')
+      .select('amount, currency, installments_total')
       .eq('user_id', this.userId)
       .eq('status', 'active')
       .eq('card_id', cardId)
       .eq('direction', 'gasto')
       .eq('payment_method', 'tarjeta')
       .gte('movement_date', fromDate)
-      .lte('movement_date', toDate);
+      .lte('movement_date', toDate)
+      .or('installments_total.is.null,installments_total.eq.1');
 
     if (scope === 'operativo' || scope === 'historico') {
       query = query.eq('entry_mode', scope);
@@ -875,53 +1511,57 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
     const { data, error } = await query;
     if (error) throw new Error(error.message);
 
-    const total = (data ?? []).reduce(
-      (
-        acc,
-        row: {
-          amount: number | string;
-          currency?: string | null;
-          fx_ars_per_usd?: number | string | null;
-          installments_total: number | null;
-        },
-      ) => {
-        const effective = effectiveMovementArsAmount(row);
-        if (!Number.isFinite(effective) || effective <= 0) return acc;
-        const installmentsTotal =
-          typeof row.installments_total === 'number' &&
-          Number.isFinite(row.installments_total) &&
-          row.installments_total > 1 ?
-            row.installments_total
-          : 1;
-        return acc + effective / installmentsTotal;
-      },
-      0,
-    );
-
-    return round2(total);
+    const bucket = emptyBucket();
+    for (const row of data ?? []) {
+      const r = row as { amount: number | string; currency?: string | null };
+      const n = Number(r.amount);
+      if (!Number.isFinite(n)) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') bucket.usd += n;
+      else bucket.ars += n;
+    }
+    return { ars: round2(bucket.ars), usd: round2(bucket.usd) };
   }
 
-  private async getStatementDebtDueUntil(
+  /** Suma cuotas completas del período de facturación (año/mes del cierre del ciclo actual). */
+  private async sumCardInstallmentsForBillingPeriodBuckets(
     cardId: string,
-    toDueDateInclusive: string,
-  ): Promise<{ hasDueStatements: boolean; outstandingAmount: number }> {
+    year: number,
+    month: number,
+    _scope: EntryScope,
+  ): Promise<MoneyBucket> {
     const { data, error } = await this.client
-      .from('card_statements')
-      .select('outstanding_amount, status, due_date')
-      .eq('user_id', this.userId)
-      .eq('card_id', cardId)
-      .lte('due_date', toDueDateInclusive)
-      .in('status', ['abierto', 'cerrado', 'vencido', 'pagado']);
+      .from('card_debt_installments')
+      .select(
+        'amount, status, card_installment_debts!inner(card_id, user_id, status, currency)',
+      )
+      .eq('billing_period_year', year)
+      .eq('billing_period_month', month)
+      .eq('card_installment_debts.card_id', cardId)
+      .eq('card_installment_debts.user_id', this.userId)
+      .neq('status', 'pagada');
+
     if (error) throw new Error(error.message);
 
-    const total = (data ?? []).reduce((acc, row: { outstanding_amount: number | string }) => {
-      const n = Number(row.outstanding_amount);
-      return Number.isFinite(n) ? acc + Math.max(n, 0) : acc;
-    }, 0);
-    return {
-      hasDueStatements: (data ?? []).length > 0,
-      outstandingAmount: round2(total),
-    };
+    const bucket = emptyBucket();
+    for (const row of data ?? []) {
+      const r = row as {
+        amount: number | string;
+        status: string;
+        card_installment_debts:
+          | { status: string; currency?: string | null }
+          | Array<{ status: string; currency?: string | null }>;
+      };
+      const debtRef = Array.isArray(r.card_installment_debts) ?
+        r.card_installment_debts[0]
+      : r.card_installment_debts;
+      if (!debtRef) continue;
+      if (debtRef.status === 'pagada' || debtRef.status === 'cancelada') continue;
+      const n = Number(r.amount);
+      if (!Number.isFinite(n)) continue;
+      if (normalizeMovementCurrency(debtRef.currency) === 'USD') bucket.usd += n;
+      else bucket.ars += n;
+    }
+    return { ars: round2(bucket.ars), usd: round2(bucket.usd) };
   }
 
   private async resolveCycleWindows(
@@ -999,9 +1639,7 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
   ): Promise<CardStatementRow> {
     const { data: existing, error: existingError } = await this.client
       .from('card_statements')
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
+      .select(CARD_STATEMENT_SELECT_FIELDS)
       .eq('user_id', this.userId)
       .eq('card_id', cardId)
       .eq('period_year', year)
@@ -1021,15 +1659,16 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
         closed_at: closedAt,
         due_date: dueDate,
         total_amount: 0,
+        total_amount_usd: 0,
         minimum_payment: 0,
         interest_amount: 0,
         paid_amount: 0,
+        paid_amount_usd: 0,
         outstanding_amount: 0,
+        outstanding_amount_usd: 0,
         status: 'abierto',
       })
-      .select(
-        'id, card_id, period_year, period_month, opened_at, closed_at, due_date, total_amount, paid_amount, outstanding_amount, status',
-      )
+      .select(CARD_STATEMENT_SELECT_FIELDS)
       .single();
     if (createError) throw new Error(createError.message);
     if (!created) throw new Error('No se pudo crear resumen mensual de tarjeta');
@@ -1099,6 +1738,396 @@ export class SupabaseTarjetaRepository implements TarjetaRepositoryPort {
       if (updateError) throw new Error(updateError.message);
     }
   }
+
+  async updateStatementWindow(
+    cardId: string,
+    statementId: string,
+    input: StatementWindowInput,
+  ): Promise<UpdateStatementWindowResult | null> {
+    const card = await this.findById(cardId);
+    if (!card) return null;
+
+    const { data: rawStmt, error: fetchErr } = await this.client
+      .from('card_statements')
+      .select(
+        'id, opened_at, closed_at, due_date, total_amount, period_year, period_month, status',
+      )
+      .eq('id', statementId)
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .maybeSingle();
+    if (fetchErr) throw new Error(fetchErr.message);
+    if (!rawStmt) return null;
+
+    const opened_at =
+      input.opened_at !== undefined ?
+        input.opened_at
+      : String(rawStmt.opened_at).slice(0, 10);
+    const closed_at =
+      input.closed_at !== undefined ?
+        input.closed_at
+      : String(rawStmt.closed_at).slice(0, 10);
+    const due_date =
+      input.due_date !== undefined ?
+        input.due_date
+      : String(rawStmt.due_date).slice(0, 10);
+
+    if (!isIsoDate(opened_at) || !isIsoDate(closed_at) || !isIsoDate(due_date)) {
+      throw new Error('opened_at, closed_at y due_date deben ser YYYY-MM-DD');
+    }
+    if (opened_at > closed_at) {
+      throw new Error('opened_at no puede ser mayor que closed_at');
+    }
+
+    await this.assertStatementWindowNoOverlap(cardId, statementId, opened_at, closed_at);
+
+    const previous_total = round2(Number(rawStmt.total_amount));
+
+    const sync: StatementSyncReport = {
+      added_movements: 0,
+      removed_movements: 0,
+      added_installments: 0,
+      removed_installments: 0,
+      previous_total,
+      new_total: previous_total,
+    };
+
+    const { error: updErr } = await this.client
+      .from('card_statements')
+      .update({ opened_at, closed_at, due_date })
+      .eq('id', statementId)
+      .eq('user_id', this.userId);
+    if (updErr) throw new Error(updErr.message);
+
+    await this.syncMovementLinesForStatementWindow(cardId, statementId, opened_at, closed_at, sync);
+    await this.syncInstallmentLinesForStatementWindow(cardId, statementId, opened_at, closed_at, sync);
+
+    await this.recalculateStatementTotals(statementId);
+
+    const { data: afterStmt } = await this.client
+      .from('card_statements')
+      .select('total_amount')
+      .eq('id', statementId)
+      .single();
+    sync.new_total = round2(Number(afterStmt?.total_amount ?? 0));
+
+    const detail = await this.getStatementById(cardId, statementId);
+    if (!detail) throw new Error('No se pudo cargar el resumen actualizado');
+    return { statement: detail, sync };
+  }
+
+  private async assertStatementWindowNoOverlap(
+    cardId: string,
+    exceptStatementId: string,
+    from: string,
+    to: string,
+  ): Promise<void> {
+    const { data: rows, error } = await this.client
+      .from('card_statements')
+      .select('id, opened_at, closed_at, period_year, period_month')
+      .eq('user_id', this.userId)
+      .eq('card_id', cardId)
+      .neq('id', exceptStatementId);
+    if (error) throw new Error(error.message);
+    for (const r of rows ?? []) {
+      const o = String(r.opened_at).slice(0, 10);
+      const c = String(r.closed_at).slice(0, 10);
+      if (intervalsOverlapInclusive(from, to, o, c)) {
+        throw new Error(
+          `El rango se solapa con el resumen ${r.period_year}-${String(r.period_month).padStart(2, '0')}`,
+        );
+      }
+    }
+  }
+
+  private async recalculateStatementTotals(statementId: string): Promise<void> {
+    const { data: stmt, error: sErr } = await this.client
+      .from('card_statements')
+      .select('status, card_id')
+      .eq('id', statementId)
+      .eq('user_id', this.userId)
+      .maybeSingle();
+    if (sErr) throw new Error(sErr.message);
+    if (!stmt) return;
+
+    const { data: lines, error: lErr } = await this.client
+      .from('card_statement_lines')
+      .select('amount, currency, movement_id, detail')
+      .eq('statement_id', statementId);
+    if (lErr) throw new Error(lErr.message);
+
+    const movementIds = Array.from(
+      new Set(
+        (lines ?? [])
+          .map((r: { movement_id?: string | null }) => r.movement_id ?? null)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0),
+      ),
+    );
+    const movementMetaById = new Map<string, StatementLineMovementMeta>();
+    if (movementIds.length > 0) {
+      const { data: movementRows, error: movementErr } = await this.client
+        .from('movements')
+        .select('id, direction, raw_message')
+        .eq('user_id', this.userId)
+        .in('id', movementIds);
+      if (movementErr) throw new Error(movementErr.message);
+      for (const row of (movementRows ?? []) as Array<{
+        id: string;
+        direction?: string | null;
+        raw_message?: string | null;
+      }>) {
+        movementMetaById.set(row.id, {
+          direction: String(row.direction ?? 'gasto'),
+          raw_message: typeof row.raw_message === 'string' ? row.raw_message : null,
+        });
+      }
+    }
+
+    let totalArs = 0;
+    let totalUsd = 0;
+    for (const row of lines ?? []) {
+      const r = row as {
+        amount: number | string;
+        currency?: string | null;
+        movement_id?: string | null;
+        detail?: string | null;
+      };
+      const signedAmt = signedStatementLineAmountForTotals(r, movementMetaById);
+      if (signedAmt === null) continue;
+      if (normalizeMovementCurrency(r.currency) === 'USD') totalUsd += signedAmt;
+      else totalArs += signedAmt;
+    }
+    totalArs = round2(totalArs);
+    totalUsd = round2(totalUsd);
+    const carryRecalc = await this.getStatementOpeningCarryBuckets(statementId);
+    totalArs = round2(totalArs + carryRecalc.ars);
+    totalUsd = round2(totalUsd + carryRecalc.usd);
+    const cardId = String((stmt as { card_id: string }).card_id);
+    await this.applyUnallocatedCreditToStatement(cardId, statementId, totalArs, totalUsd);
+    const prior = String((stmt as { status: string }).status ?? 'cerrado');
+    const statusWhenOutstanding =
+      prior === 'vencido' ? 'vencido'
+      : prior === 'abierto' ? 'abierto'
+      : 'cerrado';
+    await this.syncStatementTotalsFromLinesAndAllocations(statementId, statusWhenOutstanding);
+  }
+
+  private async syncMovementLinesForStatementWindow(
+    cardId: string,
+    statementId: string,
+    from: string,
+    to: string,
+    sync: StatementSyncReport,
+  ): Promise<void> {
+    const { data: myLines, error: e1 } = await this.client
+      .from('card_statement_lines')
+      .select('id, movement_id')
+      .eq('statement_id', statementId)
+      .eq('source_type', 'movement')
+      .not('movement_id', 'is', null);
+    if (e1) throw new Error(e1.message);
+
+    const movementIdsOnStmt = (myLines ?? [])
+      .map((r: { movement_id: string | null }) => r.movement_id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+    if (movementIdsOnStmt.length > 0) {
+      const { data: movements, error: e2 } = await this.client
+        .from('movements')
+        .select('id, movement_date, installments_total')
+        .in('id', movementIdsOnStmt);
+      if (e2) throw new Error(e2.message);
+      const byId = new Map(
+        (movements ?? []).map((m: { id: string; movement_date: string; installments_total?: number | null }) => [
+          m.id,
+          {
+            movementDate: m.movement_date,
+            installmentsTotal:
+              typeof m.installments_total === 'number' ? m.installments_total : null,
+          },
+        ]),
+      );
+      for (const line of myLines ?? []) {
+        const mid = line.movement_id as string | null;
+        if (!mid) continue;
+        const movement = byId.get(mid);
+        const mdStr = movement !== undefined ? String(movement.movementDate).slice(0, 10) : '';
+        const isInstallmentMovement =
+          movement?.installmentsTotal !== null &&
+          movement?.installmentsTotal !== undefined &&
+          movement.installmentsTotal > 1;
+        if (isInstallmentMovement || !mdStr || mdStr < from || mdStr > to) {
+          const { error: delErr } = await this.client
+            .from('card_statement_lines')
+            .delete()
+            .eq('id', line.id);
+          if (delErr) throw new Error(delErr.message);
+          sync.removed_movements += 1;
+        }
+      }
+    }
+
+    const { data: inRange, error: e3 } = await this.client
+      .from('movements')
+      .select('id, detail, amount, currency, fx_ars_per_usd, installments_total, direction')
+      .eq('user_id', this.userId)
+      .eq('status', 'active')
+      .eq('card_id', cardId)
+      .eq('payment_method', 'tarjeta')
+      .eq('entry_mode', 'operativo')
+      .or('direction.eq.gasto,and(direction.eq.ingreso,settled_card_id.is.null)')
+      .or('installments_total.is.null,installments_total.lte.1')
+      .gte('movement_date', from)
+      .lte('movement_date', to);
+    if (e3) throw new Error(e3.message);
+
+    for (const movement of (inRange ?? []) as Array<{
+      id: string;
+      detail: string | null;
+      amount: number | string;
+      currency?: string | null;
+      fx_ars_per_usd?: number | string | null;
+      direction?: string | null;
+    }>) {
+      const { data: existingLine, error: e4 } = await this.client
+        .from('card_statement_lines')
+        .select('id, statement_id')
+        .eq('movement_id', movement.id)
+        .maybeSingle();
+      if (e4) throw new Error(e4.message);
+
+      if (existingLine && existingLine.statement_id === statementId) continue;
+
+      if (existingLine && existingLine.statement_id !== statementId) {
+        const otherId = existingLine.statement_id as string;
+        const { error: delOtherErr } = await this.client
+          .from('card_statement_lines')
+          .delete()
+          .eq('id', existingLine.id);
+        if (delOtherErr) throw new Error(delOtherErr.message);
+        await this.recalculateStatementTotals(otherId);
+      }
+
+      const linePayload = movementLinePayload(movement);
+      const { error: insErr } = await this.client.from('card_statement_lines').insert({
+        statement_id: statementId,
+        source_type: 'movement',
+        movement_id: movement.id,
+        installment_id: null,
+        detail: movement.detail || 'Consumo tarjeta',
+        amount: linePayload.amount,
+        currency: linePayload.currency,
+        fx_ars_per_usd: linePayload.fx_ars_per_usd,
+      });
+      if (insErr) throw new Error(insErr.message);
+      sync.added_movements += 1;
+    }
+  }
+
+  private async syncInstallmentLinesForStatementWindow(
+    cardId: string,
+    statementId: string,
+    from: string,
+    to: string,
+    sync: StatementSyncReport,
+  ): Promise<void> {
+    const { data: linkedToThis, error: e1 } = await this.client
+      .from('card_debt_installments')
+      .select('id, due_date, status')
+      .eq('statement_id', statementId);
+    if (e1) throw new Error(e1.message);
+
+    for (const row of linkedToThis ?? []) {
+      const dd = String(row.due_date).slice(0, 10);
+      if (row.status === 'pagada' || dd < from || dd > to) {
+        const { error: delLineErr } = await this.client
+          .from('card_statement_lines')
+          .delete()
+          .eq('installment_id', row.id)
+          .eq('source_type', 'installment');
+        if (delLineErr) throw new Error(delLineErr.message);
+        const { error: updInstErr } = await this.client
+          .from('card_debt_installments')
+          .update({ statement_id: null, included_at: null })
+          .eq('id', row.id);
+        if (updInstErr) throw new Error(updInstErr.message);
+        sync.removed_installments += 1;
+      }
+    }
+
+    const { data: inRangeInst, error: e2 } = await this.client
+      .from('card_debt_installments')
+      .select(
+        'id, debt_id, installment_number, amount, due_date, statement_id, card_installment_debts!inner(description, card_id, user_id, currency)',
+      )
+      .eq('card_installment_debts.user_id', this.userId)
+      .eq('card_installment_debts.card_id', cardId)
+      .neq('status', 'pagada')
+      .gte('due_date', from)
+      .lte('due_date', to);
+    if (e2) throw new Error(e2.message);
+
+    for (const installment of (inRangeInst ?? []) as Array<{
+      id: string;
+      debt_id: string;
+      installment_number: number;
+      amount: number | string;
+      due_date: string;
+      statement_id: string | null;
+      card_installment_debts:
+        | { description: string; card_id: string; user_id: string; currency?: string | null }
+        | Array<{ description: string; card_id: string; user_id: string; currency?: string | null }>;
+    }>) {
+      const debtRef =
+        Array.isArray(installment.card_installment_debts) ?
+          installment.card_installment_debts[0]
+        : installment.card_installment_debts;
+      if (!debtRef || debtRef.card_id !== cardId) continue;
+
+      if (installment.statement_id === statementId) continue;
+
+      const { data: existingLine, error: e3 } = await this.client
+        .from('card_statement_lines')
+        .select('id, statement_id')
+        .eq('installment_id', installment.id)
+        .maybeSingle();
+      if (e3) throw new Error(e3.message);
+
+      if (existingLine) {
+        const otherId = existingLine.statement_id as string;
+        const { error: dErr } = await this.client.from('card_statement_lines').delete().eq('id', existingLine.id);
+        if (dErr) throw new Error(dErr.message);
+        await this.recalculateStatementTotals(otherId);
+      }
+
+      const { error: nullErr } = await this.client
+        .from('card_debt_installments')
+        .update({ statement_id: null, included_at: null })
+        .eq('id', installment.id);
+      if (nullErr) throw new Error(nullErr.message);
+
+      const instCurrency = normalizeMovementCurrency(debtRef.currency);
+      const { error: lineErr } = await this.client.from('card_statement_lines').insert({
+        statement_id: statementId,
+        source_type: 'installment',
+        movement_id: null,
+        installment_id: installment.id,
+        detail: `${debtRef.description} - cuota ${installment.installment_number}`,
+        amount: Number(installment.amount),
+        currency: instCurrency,
+        fx_ars_per_usd: null,
+      });
+      if (lineErr) throw new Error(lineErr.message);
+
+      const { error: upErr } = await this.client
+        .from('card_debt_installments')
+        .update({ statement_id: statementId, included_at: new Date().toISOString() })
+        .eq('id', installment.id);
+      if (upErr) throw new Error(upErr.message);
+
+      sync.added_installments += 1;
+    }
+  }
 }
 
 function mapCardRow(row: {
@@ -1138,10 +2167,20 @@ function mapStatementRow(row: {
   closed_at: string;
   due_date: string;
   total_amount: number | string;
+  total_amount_usd?: number | string | null;
   paid_amount: number | string;
+  paid_amount_usd?: number | string | null;
   outstanding_amount: number | string;
+  outstanding_amount_usd?: number | string | null;
+  opening_carry_amount?: number | string | null;
+  opening_carry_amount_usd?: number | string | null;
   status: string;
 }): CardStatementRow {
+  const tusd = Number(row.total_amount_usd ?? 0);
+  const pusd = Number(row.paid_amount_usd ?? 0);
+  const ousd = Number(row.outstanding_amount_usd ?? 0);
+  const oca = Number(row.opening_carry_amount ?? 0);
+  const ocu = Number(row.opening_carry_amount_usd ?? 0);
   return {
     id: row.id,
     card_id: row.card_id,
@@ -1151,8 +2190,40 @@ function mapStatementRow(row: {
     closed_at: row.closed_at,
     due_date: row.due_date,
     total_amount: Number(row.total_amount),
+    total_amount_usd: Number.isFinite(tusd) ? tusd : 0,
     paid_amount: Number(row.paid_amount),
+    paid_amount_usd: Number.isFinite(pusd) ? pusd : 0,
     outstanding_amount: Number(row.outstanding_amount),
+    outstanding_amount_usd: Number.isFinite(ousd) ? ousd : 0,
+    opening_carry_amount: Number.isFinite(oca) ? oca : 0,
+    opening_carry_amount_usd: Number.isFinite(ocu) ? ocu : 0,
+    status: normalizeStatementStatus(row.status),
+  };
+}
+
+function mapPayableStatementRow(row: {
+  id: string;
+  card_id: string;
+  period_year: number;
+  period_month: number;
+  due_date: string;
+  minimum_payment?: number | string | null;
+  outstanding_amount: number | string;
+  outstanding_amount_usd?: number | string | null;
+  status: string;
+}): CardPayableStatementRow {
+  const min = Number(row.minimum_payment ?? 0);
+  const outstandingArs = Number(row.outstanding_amount);
+  const outstandingUsd = Number(row.outstanding_amount_usd ?? 0);
+  return {
+    id: row.id,
+    card_id: row.card_id,
+    period_year: Number(row.period_year),
+    period_month: Number(row.period_month),
+    due_date: row.due_date,
+    minimum_payment: Number.isFinite(min) ? min : 0,
+    outstanding_amount: Number.isFinite(outstandingArs) ? outstandingArs : 0,
+    outstanding_amount_usd: Number.isFinite(outstandingUsd) ? outstandingUsd : 0,
     status: normalizeStatementStatus(row.status),
   };
 }
@@ -1164,17 +2235,42 @@ function mapStatementLineRow(row: {
   installment_id: string | null;
   detail: string;
   amount: number | string;
+  currency?: string | null;
+  fx_ars_per_usd?: number | string | null;
+  movement_date?: string | null;
 }, installmentMeta?: {
   installment_number: number;
   total_installments: number;
-}): CardStatementLineRow {
+}, movementLineMeta?: StatementLineMovementMeta | null): CardStatementLineRow {
+  const cur = normalizeMovementCurrency(row.currency) as CardStatementLineRow['currency'];
+  const fxRaw = row.fx_ars_per_usd;
+  const fx = fxRaw === null || fxRaw === undefined || fxRaw === '' ? null : Number(fxRaw);
+  const rawAmt = Number(row.amount);
+  const meta = movementLineMeta ?? { direction: 'gasto', raw_message: null };
+  const treatAsCredit =
+    row.source_type === 'installment' ? false
+    : statementLineTreatsMovementAsCredit({
+        direction: meta.direction,
+        detail: row.detail,
+        rawMessage: meta.raw_message,
+      });
+  const signedAmount =
+    treatAsCredit && Number.isFinite(rawAmt) ? -Math.abs(rawAmt)
+    : Number.isFinite(rawAmt) ? rawAmt
+    : 0;
   return {
     id: row.id,
     source_type: row.source_type === 'installment' ? 'installment' : 'movement',
     movement_id: row.movement_id,
     installment_id: row.installment_id,
     detail: row.detail,
-    amount: Number(row.amount),
+    amount: signedAmount,
+    currency: cur,
+    fx_ars_per_usd: fx !== null && Number.isFinite(fx) ? fx : null,
+    movement_date:
+      typeof row.movement_date === 'string' && row.movement_date.trim().length > 0 ?
+        row.movement_date
+      : null,
     installment_number: installmentMeta?.installment_number,
     total_installments: installmentMeta?.total_installments,
   };
@@ -1275,6 +2371,15 @@ function normalizeCardInstallmentStatus(v: string): TarjetaDebtInstallmentRow['s
   return 'pendiente';
 }
 
+function maxPendingInstallmentCountByDebt(rows: CardPendingInstallmentRow[]): number {
+  const countsByDebt = new Map<string, number>();
+  for (const row of rows) {
+    if (row.status === 'pagada' || row.remaining_amount <= 0) continue;
+    countsByDebt.set(row.debt_id, (countsByDebt.get(row.debt_id) ?? 0) + 1);
+  }
+  return Array.from(countsByDebt.values()).reduce((max, count) => Math.max(max, count), 0);
+}
+
 function toIsoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
@@ -1283,27 +2388,24 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/** Monto en ARS para consumos de tarjeta (USD con FX guardado; sin FX no suma). */
-function effectiveMovementArsAmount(row: {
-  amount: number | string;
-  currency?: string | null;
-  fx_ars_per_usd?: number | string | null;
-}): number {
-  const amount = Number(row.amount);
-  if (!Number.isFinite(amount) || amount <= 0) return 0;
-  const c = String(row.currency ?? 'ARS').trim().toUpperCase();
-  if (c !== 'USD') return round2(amount);
-  const fx = Number(row.fx_ars_per_usd);
-  if (!Number.isFinite(fx) || fx <= 0) return 0;
-  return round2(amount * fx);
-}
-
 function addDaysIso(isoDate: string, days: number): string {
   const t = Date.parse(`${isoDate}T12:00:00.000Z`);
   if (Number.isNaN(t)) return isoDate;
   const d = new Date(t);
   d.setUTCDate(d.getUTCDate() + days);
   return toIsoDate(d);
+}
+
+/** Suma meses calendario en UTC (misma lógica que en `supabase-transaction.repository`). */
+function addMonthsIso(isoDate: string, months: number): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const targetMonthIndex = m - 1 + months;
+  const targetYear = y + Math.floor(targetMonthIndex / 12);
+  const monthInYear = ((targetMonthIndex % 12) + 12) % 12;
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, monthInYear + 1, 0)).getUTCDate();
+  const day = Math.min(d, daysInTargetMonth);
+  const dt = new Date(Date.UTC(targetYear, monthInYear, day));
+  return dt.toISOString().slice(0, 10);
 }
 
 function parseYearMonth(value: string): { year: number; month: number } | null {
@@ -1369,6 +2471,76 @@ function cycleWindowsByClosingDay(
   };
 }
 
+function intervalsOverlapInclusive(a1: string, a2: string, b1: string, b2: string): boolean {
+  return a1 <= b2 && b1 <= a2;
+}
+
+function dueDateInMonthAfterClose(closedAtIso: string, dueDay: number): string {
+  const t = Date.parse(`${closedAtIso}T12:00:00.000Z`);
+  if (Number.isNaN(t)) throw new Error('closed_at inválida');
+  const d = new Date(t);
+  return toIsoDate(dateWithClampedDayUTC(d.getUTCFullYear(), d.getUTCMonth() + 1, dueDay));
+}
+
+function resolveStatementPeriodForGenerate(
+  card: TarjetaRow,
+  year: number,
+  month: number,
+  override?: StatementWindowInput,
+): { from: string; to: string; due: string } {
+  const hasPart =
+    override !== undefined &&
+    (override.opened_at !== undefined ||
+      override.closed_at !== undefined ||
+      override.due_date !== undefined);
+  if (hasPart) {
+    if (!override?.opened_at || !override?.closed_at) {
+      throw new Error('Para override de ventana, enviá opened_at y closed_at');
+    }
+    if (override.opened_at > override.closed_at) {
+      throw new Error('opened_at no puede ser mayor que closed_at');
+    }
+    const due =
+      override.due_date !== undefined ?
+        override.due_date
+      : dueDateInMonthAfterClose(override.closed_at, normalizeDueDay(card.due_day, 10));
+    if (!isIsoDate(due)) throw new Error('due_date inválida');
+    return { from: override.opened_at, to: override.closed_at, due };
+  }
+  if (typeof card.closing_day === 'number') {
+    const ref = new Date(Date.UTC(year, month - 1, 15));
+    const w = cycleWindowsByClosingDay(ref, card.closing_day);
+    const due = dueDateInMonthAfterClose(w.current.to, normalizeDueDay(card.due_day, 10));
+    return { from: w.current.from, to: w.current.to, due };
+  }
+  return monthRangeByYearMonth(year, month, card.due_day ?? 10);
+}
+
+/** Periodos (año/mes de resumen) cuyo `due_date` teórico cae en [dueFrom, dueTo] (YYYY-MM-DD). */
+export function collectPeriodKeysWithDueInCalendarMonth(
+  card: TarjetaRow,
+  dueFrom: string,
+  dueTo: string,
+  anchorYear: number,
+  anchorMonth: number,
+): Array<{ year: number; month: number }> {
+  const out: Array<{ year: number; month: number }> = [];
+  const seen = new Set<string>();
+  for (let offset = -6; offset <= 6; offset++) {
+    const d = new Date(Date.UTC(anchorYear, anchorMonth - 1 + offset, 15));
+    const year = d.getUTCFullYear();
+    const month = d.getUTCMonth() + 1;
+    const key = `${year}-${month}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const period = resolveStatementPeriodForGenerate(card, year, month);
+    if (period.due >= dueFrom && period.due <= dueTo) {
+      out.push({ year, month });
+    }
+  }
+  return out;
+}
+
 type DebtBucketsInput = {
   carryOverBase: number;
   paidUntilCurrentClosing: number;
@@ -1387,11 +2559,12 @@ export function computeDebtBuckets(input: DebtBucketsInput): {
 
   // When the cycle is still open, "A pagar" should already include
   // charges accumulated up to the current closing date.
+  // "Ya llevas gastado" must reflect current-cycle spend to date.
   if (input.cycleOpen) {
     const result = {
       pendingMonthDebt: carryOverDebt,
       pendingMonthCredit,
-      nextMonthDebt: round2(Math.max(input.spentUntilNextClosing, 0)),
+      nextMonthDebt: round2(Math.max(input.spentUntilCurrentClosing, 0)),
     };
     return result;
   }
@@ -1404,17 +2577,6 @@ export function computeDebtBuckets(input: DebtBucketsInput): {
     ),
   };
   return result;
-}
-
-function isCycleOpenForReference(reference: Date, closingDay: number | null | undefined): boolean {
-  if (!Number.isInteger(closingDay)) return false;
-  const normalizedClosing = Number(closingDay);
-  if (normalizedClosing < 1) return false;
-  const year = reference.getUTCFullYear();
-  const month = reference.getUTCMonth();
-  const monthLastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
-  const effectiveClosing = Math.min(normalizedClosing, monthLastDay);
-  return reference.getUTCDate() <= effectiveClosing;
 }
 
 function dateWithClampedDayUTC(year: number, monthIndex: number, day: number): Date {

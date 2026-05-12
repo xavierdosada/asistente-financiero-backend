@@ -170,6 +170,11 @@ export class SupabaseFixedExpenseRepository implements FixedExpenseRepositoryPor
       const startMonth = normalizeOptionalMonthStart((row as { start_month?: string | null }).start_month);
       return !startMonth || startMonth <= monthStart;
     });
+    const blockedByFutureStartMonth = (definitions ?? []).filter((row) => {
+      if (existingIds.has(String(row.id))) return false;
+      const startMonth = normalizeOptionalMonthStart((row as { start_month?: string | null }).start_month);
+      return Boolean(startMonth && startMonth > monthStart);
+    }).length;
     if (!missingDefinitions.length) {
       await this.syncCardDueDatesForMonth(monthStart);
       return 0;

@@ -28,7 +28,8 @@ Campos cuando el mensaje describe un ingreso o gasto concreto (montos explícito
   - Solo dividí un total por la cantidad de cuotas cuando el mensaje indique claramente que el monto es TOTAL
     (ej: "total 13503,33 en 3 cuotas", "importe total 13503,33 financiado en 3 cuotas", "gasté en total 13503,33 en 3 cuotas")
     y NO haya indicación de cuota puntual/progreso.
-  Excepción: en pagos de cuota de préstamo (ej: "pagué la cuota del préstamo galeno"), podés devolver amount=null para que el backend complete automáticamente la cuota vigente.
+  Excepción: en pagos de cuota de préstamo (ej: "pagué la cuota del préstamo galeno") o pagos de tarjeta con monto implícito
+  (ej: "pagué el mínimo de la tarjeta BBVA", "pagué el total del resumen VISA"), podés devolver amount=null para que el backend complete automáticamente el importe vigente.
 - type: "ingreso" si es dinero que entra (cobro, sueldo, venta, depósito) o "gasto" si sale (compra, factura, pago).
 - detail: frase corta qué fue (ej: "supermercado", "alquiler marzo").
 - categoria_nombre: nombre de categoría alineado con la lista de categorías registradas que te damos abajo (copiá el texto exacto si coincide). Si ninguna encaja bien pero el gasto es obvio, elegí la más cercana. Si la lista está vacía en el contexto, usá null (el backend fallará hasta que haya categorías).

@@ -28,6 +28,24 @@ export type LoanInstallmentRow = {
   paid_at: string | null;
 };
 
+export type LoanPaymentRow = {
+  id: string;
+  loan_id: string;
+  loan_name: string;
+  movement_id: string;
+  amount: number;
+  currency: string;
+  detail: string;
+  payment_date: string;
+  movement_date: string;
+  created_at: string;
+};
+
+export type LoanCurrentMonthInstallmentUpdateRow = {
+  loan: LoanRow;
+  installment: LoanInstallmentRow;
+};
+
 export type CreateLoanInput = {
   name: string;
   lender?: string | null;
@@ -61,6 +79,16 @@ export interface LoanRepositoryPort {
   list(): Promise<LoanRow[]>;
   findById(id: string): Promise<LoanRow | null>;
   installmentsByLoanId(id: string): Promise<LoanInstallmentRow[] | null>;
+  listPayments(loanId?: string): Promise<LoanPaymentRow[]>;
+  updateCurrentMonthInstallment(
+    loanId: string,
+    amount: number,
+  ): Promise<LoanCurrentMonthInstallmentUpdateRow | null>;
+  adjustPayment(
+    loanId: string,
+    paymentId: string,
+    patch: { amount: number; payment_date?: string },
+  ): Promise<LoanPaymentRow | null>;
   create(input: CreateLoanInput): Promise<LoanRow>;
   update(id: string, input: UpdateLoanInput): Promise<LoanRow | null>;
   deleteById(id: string): Promise<void>;
