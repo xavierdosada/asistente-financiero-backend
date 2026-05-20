@@ -290,9 +290,8 @@ describe('Tarjetas endpoints', () => {
           installment_number: 6,
           due_date: '2026-06-10',
           amount: 100000,
-          paid_amount: 0,
           remaining_amount: 100000,
-          status: 'pendiente',
+          due_overdue: false,
         },
       ],
     });

@@ -858,7 +858,9 @@ export class ProcessChatMessageUseCase {
       /\bcuotas?\s*\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
       /\bc\.\s*\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
       /\bcuotas?\s*\d{1,3}\b/.test(source) ||
-      /\b\d{1,3}\s*\/\s*\d{1,3}\b/.test(source) ||
+      // Ignorá fechas tipo DD/MM/YYYY o DD/MM/YY: el N/M no puede estar
+      // precedido ni seguido por otro /digito (eso es una fecha de 3 partes).
+      /(?<!\d\s*\/\s*)\b\d{1,3}\s*\/\s*\d{1,3}\b(?!\s*\/\s*\d)/.test(source) ||
       /\b(?:en\s*)?\d{1,3}\s*cuotas?\b/.test(source)
     );
   }

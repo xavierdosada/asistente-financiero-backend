@@ -223,6 +223,7 @@ export class SupabaseMovementQueryRepository {
     // Este paso asegura eliminar la deuda en cuotas (y cuotas en card_debt_installments en cascada)
     // creada con source_movement_id = este movimiento, más líneas de resumen vinculadas.
     if (deleted || alreadyDeleted) {
+      await this.rollbackCardStatementPaymentByMovement(id);
       await this.removeCardDebtBySourceMovement(id);
       await this.resetFixedExpenseInstancesToPending(fixedExpenseInstanceIdsPaidByMovement);
     }

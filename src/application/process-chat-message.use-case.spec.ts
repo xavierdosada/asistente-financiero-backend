@@ -470,6 +470,38 @@ describe('ProcessChatMessageUseCase entry mode', () => {
     expect(transactions.save).not.toHaveBeenCalled();
   });
 
+  it('does not treat a DD/MM/YYYY date as a card installment', async () => {
+    prefs.get.mockResolvedValue({
+      auto_create_category_default: false,
+      default_entry_mode: 'operativo',
+      default_usd_ars_rate: null,
+    });
+    parser.parse.mockResolvedValueOnce({
+      save: true,
+      currency: 'ARS',
+      amount: 88056,
+      type: 'gasto',
+      detail: 'ESCUELA DE MEDICOS',
+      categoriaNombre: 'Salud',
+      medioPago: 'efectivo',
+      tarjetaNombre: null,
+      movementDate: '2026-05-08',
+      installmentsTotal: null,
+    });
+
+    const res = await useCase.execute('08/05/2026 ESCUELA DE MEDICOS $ 88.056,00', {
+      forcedPaymentMethod: 'efectivo',
+    });
+
+    expect(res).toMatchObject({ saved: true });
+    expect(transactions.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        medioPago: 'efectivo',
+        installmentsTotal: null,
+      }),
+    );
+  });
+
   it('allows a card-looking installment as cash after explicit UI confirmation', async () => {
     prefs.get.mockResolvedValue({
       auto_create_category_default: false,

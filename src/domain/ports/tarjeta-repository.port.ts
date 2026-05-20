@@ -130,16 +130,17 @@ export type CardPendingInstallmentRow = {
   installment_number: number;
   due_date: string;
   amount: number;
-  paid_amount: number;
+  /** Monto de la cuota mientras sigue fuera de un resumen ya cerrado (luego el adeudo pasa al resumen de la tarjeta). */
   remaining_amount: number;
-  status: 'pendiente' | 'pagada' | 'vencida';
+  /** Solo calendario: vencimiento proyectado ya pasó (no implica imputación de pago a esta cuota). */
+  due_overdue: boolean;
 };
 
 /** Respuesta de GET /tarjetas/:id/cuotas-pendientes */
 export type CardPendingInstallmentsResult = {
   /** Máxima cantidad de cuotas pendientes por deuda; las deudas corren en paralelo. */
   pending_count: number;
-  /** Suma de saldos restantes de esas cuotas. */
+  /** Suma de `remaining_amount` de la próxima cuota elegible por cada deuda (no acumula todas las cuotas futuras). */
   total_remaining_amount: number;
   installments: CardPendingInstallmentRow[];
 };
